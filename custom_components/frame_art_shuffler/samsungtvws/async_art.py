@@ -538,7 +538,16 @@ class SamsungTVAsyncArt(SamsungTVWSAsyncConnection):
             {"request": "get_matte_list"}
         )
         assert data
-        return (json.loads(data["matte_type_list"]), json.loads(data.get("matte_color_list"))) if include_colour else json.loads(data["matte_type_list"])
+        # v0.97 TVs return matte info under different keys than newer firmware.
+        type_key = "matte_type_list" if "matte_type_list" in data else "matte_list"
+        color_key = "matte_color_list" if "matte_color_list" in data else "color_list"
+        if type_key not in data:
+            return ([], []) if include_colour else []
+        matte_types = json.loads(data[type_key])
+        if include_colour:
+            matte_colors = json.loads(data[color_key]) if color_key in data else []
+            return matte_types, matte_colors
+        return matte_types
 
     async def change_matte(self, content_id, matte_id=None, portrait_matte=None):
         '''

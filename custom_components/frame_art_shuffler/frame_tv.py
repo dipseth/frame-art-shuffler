@@ -71,6 +71,11 @@ _WOL_BROADCAST_IP = "255.255.255.255"
 _WOL_BROADCAST_PORT = 9
 _WOL_WAKE_DELAY = 2
 
+# Per-IP cache: TVs that have returned error -9 for set_photo_filter.
+# Populated on first failure so we skip the call on subsequent shuffles
+# rather than generating a warning every cycle.
+_filters_unsupported: set[str] = set()
+
 # Use a dedicated directory for integration data to keep /config clean
 # This matches the structure we want for tokens as well
 DATA_DIR = Path("/config/frame_art_shuffler")
@@ -661,16 +666,32 @@ def set_art_on_tv_deleteothers(
 
             # Apply photo filter if specified
             if photo_filter is not None and photo_filter.lower() not in ("none", ""):
-                try:
-                    _log_progress(f"Applying photo filter '{photo_filter}' to {ip}")
-                    if debug:
-                        _LOGGER.debug("Applying photo filter '%s' to content_id=%s", photo_filter, content_id)
-                    art.set_photo_filter(content_id, photo_filter)
-                    _log_progress(f"Photo filter '{photo_filter}' applied successfully")
-                    if debug:
-                        _LOGGER.debug("Successfully applied photo filter '%s'", photo_filter)
-                except Exception as filter_err:  # pylint: disable=broad-except
-                    _LOGGER.warning("Failed to apply photo filter '%s': %s", photo_filter, filter_err)
+                if ip in _filters_unsupported:
+                    _LOGGER.debug(
+                        "Skipping photo filter '%s' — TV %s does not support filters (v0.97 API)",
+                        photo_filter, ip,
+                    )
+                else:
+                    try:
+                        _log_progress(f"Applying photo filter '{photo_filter}' to {ip}")
+                        if debug:
+                            _LOGGER.debug("Applying photo filter '%s' to content_id=%s", photo_filter, content_id)
+                        art.set_photo_filter(content_id, photo_filter)
+                        _log_progress(f"Photo filter '{photo_filter}' applied successfully")
+                        if debug:
+                            _LOGGER.debug("Successfully applied photo filter '%s'", photo_filter)
+                    except Exception as filter_err:  # pylint: disable=broad-except
+                        err_str = str(filter_err)
+                        if "error number -9" in err_str:
+                            _filters_unsupported.add(ip)
+                            _LOGGER.warning(
+                                "TV %s does not support photo filters (error -9, likely v0.97 API). "
+                                "Filters will be skipped for this TV going forward. "
+                                "Remove filter values from image metadata to suppress this message.",
+                                ip,
+                            )
+                        else:
+                            _LOGGER.warning("Failed to apply photo filter '%s': %s", photo_filter, filter_err)
 
             if delete_others:
                 _log_progress("Cleaning up old images from TV memory...")
