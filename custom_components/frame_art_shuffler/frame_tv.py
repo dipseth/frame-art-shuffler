@@ -123,6 +123,38 @@ class FrameArtUploadError(FrameArtError):
     """Raised when an upload or art operation fails."""
 
 
+def get_current_artwork(ip: str) -> dict | None:
+    """Return the TV's actual currently-displayed artwork, or None on failure.
+
+    Queries the TV via WebSocket and resolves the content_id to a local
+    filename using the content_id_map.  Safe to call from an executor thread.
+
+    Returns a dict with keys:
+        content_id  – Samsung content ID (e.g. "MY_F0051")
+        matte_id    – current matte (e.g. "shadowbox_sage") or None
+        filename    – local filename if mapped, else None
+    """
+    try:
+        with _FrameTVSession(ip, timeout=10) as session:
+            data = session.art.get_current()
+        if not data:
+            return None
+        content_id = data.get("content_id")
+        matte_id = data.get("matte_id")
+        # Resolve content_id → filename via the cached map
+        filename: str | None = None
+        mapping = _load_content_map()
+        tv_map = mapping.get(ip, {})
+        for fname, cid in tv_map.items():
+            if cid == content_id:
+                filename = fname
+                break
+        return {"content_id": content_id, "matte_id": matte_id, "filename": filename}
+    except Exception as err:  # pylint: disable=broad-except
+        _LOGGER.debug("get_current_artwork(%s) failed: %s", ip, err)
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Content-ID mapping: tracks which local filenames are already on which TV
 # so we can use fast select_image instead of re-uploading every time.

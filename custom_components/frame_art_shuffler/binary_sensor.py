@@ -16,6 +16,8 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.event import async_track_time_interval
 
+from homeassistant.helpers.dispatcher import async_dispatcher_send
+
 from .config_entry import get_active_tagset_name, get_tv_config
 from .const import DOMAIN
 from . import frame_tv
@@ -26,6 +28,12 @@ _LOGGER = logging.getLogger(__name__)
 TV_STATUS_POLL_INTERVAL = timedelta(seconds=10)
 # Timeout for status checks (short to avoid blocking)
 TV_STATUS_CHECK_TIMEOUT = 5
+
+# Slower poll for actual artwork state (WebSocket — more expensive than REST)
+TV_ACTUAL_STATE_POLL_INTERVAL = timedelta(seconds=30)
+
+# Signal fired when actual TV artwork state is refreshed
+SIGNAL_TV_ACTUAL_STATE = f"{DOMAIN}_tv_actual_state"  # + _{entry_id}_{tv_id}
 
 
 SCREEN_ON_DESCRIPTION = BinarySensorEntityDescription(
@@ -63,6 +71,9 @@ async def async_setup_entry(
             # Initialize status cache for this TV
             tv_status_cache[tv_id] = {
                 "screen_on": None,
+                "actual_content_id": None,
+                "actual_matte": None,
+                "actual_filename": None,
             }
 
             # Create binary sensors per TV
@@ -193,6 +204,57 @@ async def async_setup_entry(
                                 )
                                 _LOGGER.debug(f"Display log: Started session for {tv_name} (screen on detected by poll)")
 
+    # Poll actual artwork state from TV (WebSocket — slower, 30s interval)
+    async def async_poll_actual_state(_now: Any) -> None:
+        """Poll every TV for its actual currently-displayed artwork."""
+        for tv in coordinator.data or []:
+            tv_id = tv.get("id")
+            if not tv_id:
+                continue
+
+            tv_config = get_tv_config(entry, tv_id)
+            if not tv_config:
+                continue
+
+            ip = tv_config.get("ip")
+            if not ip:
+                continue
+
+            # Skip if screen is known to be off — no point opening a WS connection
+            if tv_status_cache.get(tv_id, {}).get("screen_on") is False:
+                continue
+
+            try:
+                artwork = await hass.async_add_executor_job(frame_tv.get_current_artwork, ip)
+            except Exception as err:
+                _LOGGER.debug("Failed to poll actual artwork for %s: %s", tv_id, err)
+                artwork = None
+
+            if artwork is None:
+                continue
+
+            cache = tv_status_cache.setdefault(tv_id, {})
+            changed = (
+                cache.get("actual_content_id") != artwork.get("content_id")
+                or cache.get("actual_matte") != artwork.get("matte_id")
+            )
+            cache["actual_content_id"] = artwork.get("content_id")
+            cache["actual_matte"] = artwork.get("matte_id")
+            cache["actual_filename"] = artwork.get("filename")
+
+            if changed:
+                async_dispatcher_send(
+                    hass,
+                    f"{SIGNAL_TV_ACTUAL_STATE}_{entry.entry_id}_{tv_id}",
+                )
+
+    cancel_actual_poll = async_track_time_interval(
+        hass,
+        async_poll_actual_state,
+        TV_ACTUAL_STATE_POLL_INTERVAL,
+    )
+    entry.async_on_unload(cancel_actual_poll)
+
     # Start polling
     cancel_poll = async_track_time_interval(
         hass,
@@ -201,8 +263,9 @@ async def async_setup_entry(
     )
     entry.async_on_unload(cancel_poll)
 
-    # Do an initial poll
+    # Initial polls
     hass.async_create_task(async_poll_tv_status(None))
+    hass.async_create_task(async_poll_actual_state(None))
 
 
 class FrameArtScreenOnEntity(BinarySensorEntity):
