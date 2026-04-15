@@ -87,7 +87,7 @@ if _HA_AVAILABLE:
     from .coordinator import FrameArtCoordinator
     from .config_entry import get_tv_config, get_global_tagsets, list_tv_configs, remove_tv_config, update_tv_config, update_global_tagsets, get_effective_tags
     from . import frame_tv
-    from .frame_tv import TOKEN_DIR as DEFAULT_TOKEN_DIR, set_token_directory, tv_on, tv_off, set_art_mode, is_screen_on
+    from .frame_tv import TOKEN_DIR as DEFAULT_TOKEN_DIR, set_token_directory, tv_on, tv_off, set_art_mode, is_screen_on, is_art_mode_enabled
     from .metadata import MetadataStore
     from .dashboard import async_generate_dashboard
     from .activity import log_activity
@@ -364,7 +364,6 @@ if _HA_AVAILABLE:
             "shuffle_cache": {},
             "upload_in_progress": set(),
             "auto_shuffle_next_times": {},
-            "tv_mode_active": set(),
         }
 
         display_log = DisplayLogManager(hass, entry)
@@ -487,13 +486,12 @@ if _HA_AVAILABLE:
 
                 await hass.async_add_executor_job(
                     functools.partial(
-                        frame_tv.set_art_on_tv_deleteothers,
+                        frame_tv.display_art,
                         ip,
                         final_path,
                         mac_address=mac,
                         matte=matte,
                         photo_filter=filter_id,
-                        delete_others=True,
                     )
                 )
 
@@ -540,6 +538,8 @@ if _HA_AVAILABLE:
                         started_at=datetime.now(dt_timezone.utc),
                         matte=matte,
                     )
+                    # Flush immediately to persist - don't wait for periodic flush
+                    await display_log.async_flush(force=True)
 
                 return True
 
@@ -1670,6 +1670,25 @@ if _HA_AVAILABLE:
                 )
                 return
 
+            # Check if TV is actually in art mode (not playing TV content)
+            # PowerState "on" is reported for both art mode and regular TV usage,
+            # so we need the Art WebSocket API to distinguish the two.
+            tv_ip = tv_config.get("ip")
+            if tv_ip:
+                try:
+                    art_mode = await hass.async_add_executor_job(is_art_mode_enabled, tv_ip)
+                    if art_mode is False:
+                        log_activity(
+                            hass,
+                            entry.entry_id,
+                            tv_id,
+                            "shuffle_skipped",
+                            "Auto shuffle skipped: TV not in art mode",
+                        )
+                        return
+                except Exception:  # pylint: disable=broad-except
+                    pass  # If check fails, proceed with shuffle
+
             # Check if override is active - skip recency during overrides
             # (user deliberately chose a different tagset, don't constrain their pool)
             has_override = tv_config.get("override_tagset")
@@ -1799,15 +1818,6 @@ if _HA_AVAILABLE:
             if not tv_config:
                 return
 
-            # Don't start the off timer if TV mode is active (auto-shuffle
-            # toggled off via switch).  The user is watching TV and shouldn't
-            # be interrupted by an auto-turn-off.  Motion wake still works.
-            tv_mode_tvs = hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("tv_mode_active", set())
-            if tv_id in tv_mode_tvs:
-                tv_name = tv_config.get("name", tv_id)
-                _LOGGER.debug("Auto motion: Skipping off timer for %s (TV mode active)", tv_name)
-                return
-
             # If this is a reschedule due to upload-in-progress, use short delay
             # Otherwise use the configured off_delay_minutes
             if reschedule_count > 0:
@@ -1829,15 +1839,6 @@ if _HA_AVAILABLE:
                 tv_configs = list_tv_configs(entry)
                 tv_config = tv_configs.get(tv_id)
                 if not tv_config or not tv_config.get("enable_motion_control", False):
-                    cancel_motion_off_timer(tv_id)
-                    return
-
-                # Safety net: don't turn off if TV mode was activated after
-                # the timer was started.
-                tv_mode_tvs = hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("tv_mode_active", set())
-                if tv_id in tv_mode_tvs:
-                    tv_name = tv_config.get("name", tv_id)
-                    _LOGGER.info("Auto motion: Skipping turn-off for %s (TV mode active)", tv_name)
                     cancel_motion_off_timer(tv_id)
                     return
 
@@ -1872,10 +1873,37 @@ if _HA_AVAILABLE:
                         return
 
                 try:
+                    # Check if TV is in art mode or playing content
+                    # If playing content, transition to art mode first and restart
+                    # the timer so it turns off after another delay with no motion.
+                    # This gives a graceful wind-down: content → art → off.
+                    art_mode = await hass.async_add_executor_job(is_art_mode_enabled, ip)
+
+                    if art_mode is False:
+                        # TV is playing content — switch to art mode instead of turning off
+                        _LOGGER.info(f"Auto motion: Switching {tv_name} to art mode (was playing content, no motion)")
+                        await hass.async_add_executor_job(set_art_mode, ip)
+
+                        log_activity(
+                            hass, entry.entry_id, tv_id,
+                            "motion_off",
+                            "Switched to art mode (no motion)",
+                        )
+
+                        # Clear timer state before restarting
+                        if tv_id in motion_off_times:
+                            del motion_off_times[tv_id]
+                        async_dispatcher_send(hass, f"{DOMAIN}_motion_off_time_updated_{entry.entry_id}_{tv_id}")
+
+                        # Restart the timer so the TV will turn off if still no motion
+                        start_motion_off_timer(tv_id)
+                        return
+
+                    # Already in art mode (or unknown) — turn off the screen
                     _LOGGER.info(f"Auto motion: Turning off {tv_name} ({ip}) due to no motion")
                     await hass.async_add_executor_job(frame_tv.tv_off, ip)
                     _LOGGER.info(f"Auto motion: {tv_name} turned off successfully")
-                    
+
                     # Build message with last sensor info if available
                     motion_cache = hass.data[DOMAIN][entry.entry_id].get("motion_cache", {})
                     last_sensor = motion_cache.get(f"{tv_id}_last_sensor")
@@ -1889,7 +1917,7 @@ if _HA_AVAILABLE:
                             motion_off_msg = f"Turned off - last: {sensor_short} {minutes_ago}m ago"
                         except (ValueError, TypeError):
                             pass
-                    
+
                     log_activity(
                         hass, entry.entry_id, tv_id,
                         "motion_off",

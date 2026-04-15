@@ -344,13 +344,61 @@ class SamsungTVArt(SamsungTVWSConnection):
 
         return thumbnail_data_dict if as_dict else list(thumbnail_data_dict.values()) if len(content_id_list) > 1 else thumbnail_data
 
+    def _is_legacy_api(self) -> bool:
+        """Check if this TV uses the legacy v0.97 art API (2018/2019 models).
+
+        Legacy TVs do not support D2D socket uploads and require images to be
+        sent as WebSocket binary frames instead.
+        """
+        try:
+            version = self.get_api_version()
+            return version == "0.97"
+        except Exception:
+            return False
+
+    def _upload_ws_binary(self, file_data: bytes, *, upload_id: str, matte: str, file_type: str) -> Optional[str]:
+        """Upload via WebSocket binary frame (legacy v0.97 protocol).
+
+        2018/2019 Frame TVs reject the D2D socket ``send_image`` with error -1.
+        Instead they accept a single WebSocket binary frame containing:
+        ``2-byte header length (big-endian) + JSON header + raw image bytes``.
+        """
+        assert self.connection
+
+        ft = file_type.lower()
+        ft_header = "JPEG" if ft in ("jpg", "jpeg") else ft.upper()
+
+        inner = {
+            "request": "send_image",
+            "file_type": ft_header,
+            "matte_id": matte or "none",
+            "id": upload_id,
+        }
+
+        outer = {
+            "method": "ms.channel.emit",
+            "params": {
+                "data": json.dumps(inner),
+                "to": "host",
+                "event": "art_app_request",
+            },
+        }
+
+        header = json.dumps(outer, separators=(",", ":")).encode("utf-8")
+        payload = len(header).to_bytes(2, "big") + header + file_data
+        _LOGGING.info("Uploading %d bytes via WS binary frame (legacy v0.97)", len(file_data))
+        self.connection.send_binary(payload)
+
+        data = self.wait_for_response("image_added", upload_id)
+        return data["content_id"] if data else None
+
     def upload(self, file, matte="shadowbox_polar", portrait_matte="shadowbox_polar", file_type="png", date=None):
         if isinstance(file, str):
             file_name, file_extension = os.path.splitext(file)
             file_type = file_extension[1:]
             with open(file, 'rb') as f:
                 file = f.read()
-                
+
         file_size = len(file)
         file_type = file_type.lower()
         if file_type == "jpeg":
@@ -358,6 +406,14 @@ class SamsungTVArt(SamsungTVWSConnection):
 
         if date is None:
             date = datetime.now().strftime("%Y:%m:%d %H:%M:%S")
+
+        # Legacy v0.97 TVs (2018/2019 Frame) use WebSocket binary frames
+        # instead of the D2D socket handshake.
+        if self._is_legacy_api():
+            upload_id = self.get_uuid()
+            return self._upload_ws_binary(
+                file, upload_id=upload_id, matte=matte, file_type=file_type,
+            )
 
         data = self._send_art_request(
             {
@@ -392,7 +448,7 @@ class SamsungTVArt(SamsungTVWSConnection):
         )
 
         art_socket_raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        art_socket = get_ssl_context().wrap_socket(art_socket_raw) if conn_info.get('secured', False) else art_socket_raw  
+        art_socket = get_ssl_context().wrap_socket(art_socket_raw) if conn_info.get('secured', False) else art_socket_raw
         art_socket.connect((conn_info["ip"], int(conn_info["port"])))
         art_socket.send(len(header).to_bytes(4, "big"))
         art_socket.send(header.encode("ascii"))

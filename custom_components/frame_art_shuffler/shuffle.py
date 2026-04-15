@@ -23,7 +23,7 @@ from homeassistant.helpers.dispatcher import async_dispatcher_send
 from .activity import log_activity
 from .config_entry import get_active_tagset_name, get_effective_tags, get_tag_weights, get_tv_config, get_weighting_type
 from .const import DOMAIN
-from .frame_tv import FrameArtError, set_art_on_tv_deleteothers
+from .frame_tv import FrameArtError, set_art_on_tv_deleteothers, display_art, is_art_mode_enabled
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -465,6 +465,29 @@ async def _async_shuffle_tv_inner(
             _notify("skipped", message)
             return False
 
+        # Check if TV is actually in art mode (not playing TV content)
+        # PowerState "on" is reported for both art mode and regular TV usage,
+        # so we need the Art WebSocket API to distinguish the two.
+        tv_ip = tv_config.get("ip")
+        if tv_ip:
+            try:
+                art_mode = await hass.async_add_executor_job(is_art_mode_enabled, tv_ip)
+                if art_mode is False:
+                    message = "Shuffle skipped: TV not in art mode"
+                    log_activity(
+                        hass,
+                        entry.entry_id,
+                        tv_id,
+                        "shuffle_skipped",
+                        message,
+                    )
+                    _notify("skipped", message)
+                    return False
+            except Exception:  # pylint: disable=broad-except
+                # If we can't check art mode, proceed with shuffle
+                # (better to shuffle than to silently skip)
+                pass
+
     selected_image, matching_count, selected_tag, fresh_count, used_fallback = await hass.async_add_executor_job(
         _select_random_image,
         metadata_path,
@@ -492,9 +515,10 @@ async def _async_shuffle_tv_inner(
         image_filter = None
 
     async def _perform_upload() -> bool:
+        tv_mac = tv_config.get("mac")
         upload_func = functools.partial(
-            set_art_on_tv_deleteothers,
-            delete_others=True,
+            display_art,
+            mac_address=tv_mac,
             matte=image_matte,
             photo_filter=image_filter,
         )
@@ -564,6 +588,8 @@ async def _async_shuffle_tv_inner(
                 pool_size=pool_size_arg,
                 pool_available=pool_available_arg,
             )
+            # Flush immediately to persist - don't wait for periodic flush
+            await display_log.async_flush(force=True)
 
         _notify("success", f"Shuffled to {image_filename}")
         

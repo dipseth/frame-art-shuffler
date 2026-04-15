@@ -21,3 +21,4 @@ build/
 # Samsung Frame TV tokens (device-specific authentication)
 # Each machine should pair independently with the TV
 custom_components/frame_art_shuffler/tokens/*.token
+custom_components/frame_art_shuffler/tokens/
