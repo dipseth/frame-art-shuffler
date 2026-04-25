@@ -214,6 +214,39 @@ class MetadataStore:
                 return tv
         raise TVNotFoundError(f"TV {tv_id} not found")
 
+    # ------------------------------------------------------------------
+    # Image access helpers
+    # ------------------------------------------------------------------
+    def get_image(self, filename: str) -> Optional[Dict[str, Any]]:
+        """Return the metadata dict for a single image, or None if not found."""
+        data = _load_metadata(self._path)
+        return data.get("images", {}).get(filename)
+
+    def update_image_content_id(self, filename: str, tv_ip: str, content_id: str) -> None:
+        """Persist a TV-assigned content_id into the image's metadata entry.
+
+        This is written by the shuffler after every upload so that the Frame Art
+        Manager (and get_current_artwork fallback) can resolve content_ids back
+        to filenames without querying the TV.
+
+        Stored as ``tvContentIds: {tv_ip: "MY_F0051"}`` inside the image entry.
+        No-ops silently if the filename is not already in metadata.json.
+        """
+        data = _load_metadata(self._path)
+        images = data.get("images", {})
+        if filename not in images:
+            return  # Never create new entries; only annotate existing ones
+        images[filename].setdefault("tvContentIds", {})[tv_ip] = content_id
+        _write_metadata(self._path, data)
+
+    def find_filename_by_content_id(self, tv_ip: str, content_id: str) -> Optional[str]:
+        """Return the filename whose tvContentIds[tv_ip] == content_id, or None."""
+        data = _load_metadata(self._path)
+        for filename, info in data.get("images", {}).items():
+            if info.get("tvContentIds", {}).get(tv_ip) == content_id:
+                return filename
+        return None
+
 
 def normalize_mac(mac: Optional[str]) -> Optional[str]:
     """Normalize MAC address to lowercase colon-separated form.

@@ -21,9 +21,12 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 
 from .activity import log_activity
-from .config_entry import get_active_tagset_name, get_effective_tags, get_tag_weights, get_tv_config, get_weighting_type
+from .config_entry import (
+    get_active_tagset_name, get_effective_tags, get_tag_weights,
+    get_tv_config, get_weighting_type, upsert_content_id,
+)
 from .const import DOMAIN
-from .frame_tv import FrameArtError, set_art_on_tv_deleteothers
+from .frame_tv import FrameArtError, set_art_on_tv_deleteothers, display_art, is_art_mode_enabled, _load_content_map
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -64,23 +67,32 @@ async def async_guarded_upload(
         upload_flags.discard(tv_id)
 
 
+def _pick_with_recency(
+    candidates: list[dict[str, Any]],
+    recent_images: set[str] | None,
+) -> tuple[dict[str, Any], int, bool]:
+    """Pick a random candidate, preferring images not in recent_images.
+
+    Returns (selected, fresh_count, used_fallback).
+    used_fallback is True when recency was requested but all candidates were recent.
+    """
+    if recent_images:
+        fresh = [img for img in candidates if img["filename"] not in recent_images]
+    else:
+        fresh = []
+
+    if fresh:
+        return random.choice(fresh), len(fresh), False
+    return random.choice(candidates), 0, bool(recent_images)
+
+
 def _build_tag_pools(
     images: dict[str, dict[str, Any]],
     include_tags: list[str],
     exclude_tags: list[str],
     tag_weights: dict[str, float],
 ) -> dict[str, list[dict[str, Any]]]:
-    """Build per-tag image pools, assigning multi-tag images to highest-weight tag.
-    
-    Args:
-        images: Dict of filename -> image data from metadata
-        include_tags: Tags to include (from tagset)
-        exclude_tags: Tags to exclude (from tagset)
-        tag_weights: Dict of tag -> weight (missing = 1.0)
-        
-    Returns:
-        Dict of tag -> list of eligible images for that tag
-    """
+    """Build per-tag image pools, assigning multi-tag images to highest-weight tag."""
     tag_pools: dict[str, list[dict[str, Any]]] = {tag: [] for tag in include_tags}
     
     for filename, image_data in images.items():
@@ -114,6 +126,7 @@ def _select_random_image(
     current_image: str | None,
     tv_name: str,
     recent_images: set[str] | None = None,
+    on_tv_filenames: set[str] | None = None,
 ) -> tuple[dict[str, Any] | None, int, str | None, int, bool]:
     """Select a random eligible image.
 
@@ -133,6 +146,10 @@ def _select_random_image(
         current_image: Currently displayed image filename (to exclude)
         tv_name: TV name for logging
         recent_images: Set of filenames recently shown (for recency preference)
+        on_tv_filenames: When provided (screen is off), restrict candidates to only
+            these filenames — images already on the TV that can be shown via
+            select_image without a new upload. Falls back to unrestricted pool if
+            no on-TV images match the tag criteria.
 
     Returns:
         Tuple of (selected_image_dict, eligible_count, selected_tag_name, fresh_count, used_fallback)
@@ -149,6 +166,24 @@ def _select_random_image(
     if not images:
         _LOGGER.warning("No images found in metadata for %s", tv_name)
         return None, 0, None, 0, False
+
+    # When screen is off, restrict to images already on TV (avoid failed upload attempts).
+    # If no on-TV images match the tag criteria we fall back to the full pool so the
+    # shuffle isn't silently starved when the library and the TV are out of sync.
+    if on_tv_filenames is not None:
+        on_tv_images = {k: v for k, v in images.items() if k in on_tv_filenames}
+        if on_tv_images:
+            images = on_tv_images
+            _LOGGER.debug(
+                "Screen off for %s: restricting shuffle pool to %d on-TV images",
+                tv_name, len(images),
+            )
+        else:
+            _LOGGER.warning(
+                "Screen off for %s: no on-TV images match tag criteria, "
+                "using full pool (upload will likely fail)",
+                tv_name,
+            )
 
     # Handle case where no include tags means "all images" (image-weighted flat selection)
     if not include_tags:
@@ -183,20 +218,7 @@ def _select_random_image(
             _LOGGER.warning("No candidate images for %s after removing current image", tv_name)
             return None, eligible_count, None, 0, False
 
-        # Apply recency preference
-        if recent_images:
-            fresh_candidates = [img for img in candidates if img["filename"] not in recent_images]
-        else:
-            fresh_candidates = []
-
-        fresh_count = len(fresh_candidates)
-        if fresh_candidates:
-            selected = random.choice(fresh_candidates)
-            used_fallback = False
-        else:
-            selected = random.choice(candidates)
-            used_fallback = bool(recent_images)  # Only true fallback if recency was attempted
-
+        selected, fresh_count, used_fallback = _pick_with_recency(candidates, recent_images)
         _LOGGER.info(
             "%s selected for TV %s from %d eligible images (no tag filtering, %d fresh)",
             selected["filename"],
@@ -246,20 +268,7 @@ def _select_random_image(
             _LOGGER.warning("No candidate images for %s after removing current image", tv_name)
             return None, eligible_count, None, 0, False
 
-        # Apply recency preference
-        if recent_images:
-            fresh_candidates = [img for img in candidates if img["filename"] not in recent_images]
-        else:
-            fresh_candidates = []
-
-        fresh_count = len(fresh_candidates)
-        if fresh_candidates:
-            selected = random.choice(fresh_candidates)
-            used_fallback = False
-        else:
-            selected = random.choice(candidates)
-            used_fallback = bool(recent_images)  # Only true fallback if recency was attempted
-
+        selected, fresh_count, used_fallback = _pick_with_recency(candidates, recent_images)
         _LOGGER.info(
             "%s selected for TV %s from %d eligible images (image-weighted, %d fresh)",
             selected["filename"],
@@ -347,18 +356,7 @@ def _select_random_image(
         return None, eligible_count, None, 0, False
 
     # Apply recency preference within the selected tag's candidates
-    if recent_images:
-        fresh_candidates = [img for img in candidates if img["filename"] not in recent_images]
-    else:
-        fresh_candidates = []
-
-    fresh_count = len(fresh_candidates)
-    if fresh_candidates:
-        selected = random.choice(fresh_candidates)
-        used_fallback = False
-    else:
-        selected = random.choice(candidates)
-        used_fallback = bool(recent_images)  # Only true fallback if recency was attempted
+    selected, fresh_count, used_fallback = _pick_with_recency(candidates, recent_images)
 
     # Calculate percentage for logging
     total_weight = sum(tag_weights.get(t, 1.0) for t in include_tags)
@@ -445,10 +443,9 @@ async def _async_shuffle_tv_inner(
     shuffle_cache = entry_data.setdefault("shuffle_cache", {})
     runtime_state = shuffle_cache.get(tv_id, {})
     current_image = runtime_state.get("current_image") or tv_config.get("current_image")
-    tv_name = tv_config.get("name", tv_id)
+    status_cache = entry_data.get("tv_status_cache", {})
 
     if skip_if_screen_off:
-        status_cache = entry_data.get("tv_status_cache", {})
         screen_state = status_cache.get(tv_id, {}).get("screen_on")
         if screen_state is not True:
             if screen_state is False:
@@ -465,6 +462,41 @@ async def _async_shuffle_tv_inner(
             _notify("skipped", message)
             return False
 
+        # Check if TV is actually in art mode (not playing TV content)
+        # PowerState "on" is reported for both art mode and regular TV usage,
+        # so we need the Art WebSocket API to distinguish the two.
+        if tv_ip:
+            try:
+                art_mode = await hass.async_add_executor_job(is_art_mode_enabled, tv_ip)
+                if art_mode is False:
+                    message = "Shuffle skipped: TV not in art mode"
+                    log_activity(
+                        hass,
+                        entry.entry_id,
+                        tv_id,
+                        "shuffle_skipped",
+                        message,
+                    )
+                    _notify("skipped", message)
+                    return False
+            except Exception:  # pylint: disable=broad-except
+                # If we can't check art mode, proceed with shuffle
+                # (better to shuffle than to silently skip)
+                pass
+
+    # Determine which images are already on the TV so we can restrict the pool
+    # when the screen is sleeping (uploads fail with error -1 when screen is off,
+    # but select_image works fine for images already on TV).
+    screen_on = status_cache.get(tv_id, {}).get("screen_on")
+    on_tv_filenames: set[str] | None = None
+    if screen_on is False:
+        content_map = await hass.async_add_executor_job(_load_content_map)
+        on_tv_filenames = set(content_map.get(tv_ip, {}).keys())
+        _LOGGER.info(
+            "Screen is off for %s — shuffle restricted to %d on-TV images",
+            tv_name, len(on_tv_filenames),
+        )
+
     selected_image, matching_count, selected_tag, fresh_count, used_fallback = await hass.async_add_executor_job(
         _select_random_image,
         metadata_path,
@@ -475,6 +507,7 @@ async def _async_shuffle_tv_inner(
         current_image,
         tv_name,
         recent_images,
+        on_tv_filenames,
     )
 
     if not selected_image:
@@ -492,14 +525,19 @@ async def _async_shuffle_tv_inner(
         image_filter = None
 
     async def _perform_upload() -> bool:
+        tv_mac = tv_config.get("mac")
         upload_func = functools.partial(
-            set_art_on_tv_deleteothers,
-            delete_others=True,
+            display_art,
+            mac_address=tv_mac,
             matte=image_matte,
             photo_filter=image_filter,
         )
 
-        await hass.async_add_executor_job(upload_func, tv_ip, str(image_path))
+        returned_content_id = await hass.async_add_executor_job(upload_func, tv_ip, str(image_path))
+
+        # Persist content_id to entry.data so it survives snapshots.
+        if returned_content_id:
+            upsert_content_id(hass, entry, tv_ip, image_filename, returned_content_id)
 
         now = datetime.now(timezone.utc)
         timestamp = now.isoformat()
@@ -564,6 +602,8 @@ async def _async_shuffle_tv_inner(
                 pool_size=pool_size_arg,
                 pool_available=pool_available_arg,
             )
+            # Flush immediately to persist - don't wait for periodic flush
+            await display_log.async_flush(force=True)
 
         _notify("success", f"Shuffled to {image_filename}")
         

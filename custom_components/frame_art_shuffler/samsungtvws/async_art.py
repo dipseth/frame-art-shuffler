@@ -22,7 +22,7 @@ from . import exceptions, helper
 from .command import SamsungTVCommand
 from .async_connection import SamsungTVWSAsyncConnection
 from .remote import SamsungTVWS
-from .event import D2D_SERVICE_MESSAGE_EVENT, MS_CHANNEL_READY_EVENT
+from .event import D2D_SERVICE_MESSAGE_EVENT, MS_CHANNEL_CLIENT_CONNECT_EVENT, MS_CHANNEL_READY_EVENT
 from .async_rest import SamsungTVAsyncRest
 from .helper import get_ssl_context
 
@@ -85,18 +85,28 @@ class SamsungTVAsyncArt(SamsungTVWSAsyncConnection):
     async def open(self):
         await super().open()
 
-        # Override base class to wait for MS_CHANNEL_READY_EVENT
+        # Override base class to wait for a connection-confirmation event.
+        # Newer Frame TV firmware (2022+) sends MS_CHANNEL_CLIENT_CONNECT_EVENT
+        # instead of MS_CHANNEL_READY_EVENT.  When another client is already
+        # connected the TV may send MS_CHANNEL_CLIENT_DISCONNECT_EVENT first;
+        # we skip those and keep reading until we get a definitive result.
         assert self.connection
-        data = await self.connection.recv()
-        response = helper.process_api_response(data)
-        event = response.get("event", "*")
-        self._websocket_event(event, response)
+        _ACCEPTED = {MS_CHANNEL_READY_EVENT, MS_CHANNEL_CLIENT_CONNECT_EVENT}
+        _SKIP = {"ms.channel.clientDisconnect"}
+        last_response = None
+        for _ in range(5):
+            data = await self.connection.recv()
+            response = helper.process_api_response(data)
+            event = response.get("event", "*")
+            self._websocket_event(event, response)
+            last_response = response
+            if event in _ACCEPTED:
+                return self.connection
+            if event not in _SKIP:
+                break
 
-        if event != MS_CHANNEL_READY_EVENT:
-            await self.close()
-            raise exceptions.ConnectionFailure(response)
-
-        return self.connection
+        await self.close()
+        raise exceptions.ConnectionFailure(last_response)
 
     async def close(self):
         if self.session:
@@ -538,7 +548,16 @@ class SamsungTVAsyncArt(SamsungTVWSAsyncConnection):
             {"request": "get_matte_list"}
         )
         assert data
-        return (json.loads(data["matte_type_list"]), json.loads(data.get("matte_color_list"))) if include_colour else json.loads(data["matte_type_list"])
+        # v0.97 TVs return matte info under different keys than newer firmware.
+        type_key = "matte_type_list" if "matte_type_list" in data else "matte_list"
+        color_key = "matte_color_list" if "matte_color_list" in data else "color_list"
+        if type_key not in data:
+            return ([], []) if include_colour else []
+        matte_types = json.loads(data[type_key])
+        if include_colour:
+            matte_colors = json.loads(data[color_key]) if color_key in data else []
+            return matte_types, matte_colors
+        return matte_types
 
     async def change_matte(self, content_id, matte_id=None, portrait_matte=None):
         '''

@@ -306,3 +306,93 @@ set_recency_windows:
           max: 168
           unit_of_measurement: hours
           mode: slider
+
+sync_tv_library:
+  name: Sync TV Library
+  description: >
+    Query the TV gallery and reconcile the content_id map.
+    Removes stale entries (images no longer on TV), discovers unknown content IDs
+    by dimension-matching against the local library, and persists the result to
+    both HA entry.data (snapshot-safe) and the JSON cache file.
+
+remove_image:
+  name: Remove Image
+  description: >
+    Remove an image from all TV content_id maps when it is deleted from the library.
+    Keeps the map in sync without manual editing.
+    Called automatically by the Frame Art Manager when an image is deleted.
+  fields:
+    filename:
+      name: Filename
+      description: The image filename to remove (e.g. "cherry_blossoms.jpg")
+      required: true
+      selector:
+        text:
+    delete_from_tv:
+      name: Delete from TV
+      description: If true, also delete the image from the TV gallery.
+      required: false
+      default: false
+      selector:
+        boolean:
+
+ingest_image:
+  name: Ingest Image
+  description: >
+    Embed an image into the Qdrant semantic-search index. Called by the Frame Art
+    Manager after an upload so the library stays searchable without running
+    seed_qdrant manually. Idempotent — safe to re-call.
+  fields:
+    filename:
+      name: Filename
+      description: Image filename in the library (e.g. "sunset.jpg").
+      required: true
+      selector:
+        text:
+    force:
+      name: Force re-embed
+      description: If true, re-embed even if the image already has a Qdrant point.
+      required: false
+      default: false
+      selector:
+        boolean:
+
+reconcile_qdrant:
+  name: Reconcile Qdrant
+  description: >
+    Scan the library directory and ensure every image has a Qdrant point. Also
+    removes Qdrant points whose file no longer exists. Runs automatically every
+    hour; call this service to trigger immediately.
+  fields:
+    remove_orphans:
+      name: Remove orphans
+      description: >
+        If true, delete Qdrant points for filenames no longer in library/.
+        Default true.
+      required: false
+      default: true
+      selector:
+        boolean:
+
+set_auto_push_on_ingest:
+  name: Set auto-push-on-ingest
+  description: >
+    Toggle whether new files dropped into library/ are automatically pushed to
+    a TV right after Qdrant ingestion. Off by default — TV gallery has finite
+    capacity, so most users prefer an explicit Display click. Turn on per TV
+    if you want a true one-step add-and-display workflow.
+  fields:
+    tv_id:
+      name: TV id
+      description: >
+        Which TV to toggle. Omit to apply the same setting to every TV in the
+        config entry.
+      required: false
+      selector:
+        text:
+    enabled:
+      name: Enabled
+      description: True to auto-push, false to require a manual Display click.
+      required: true
+      selector:
+        boolean:

@@ -36,6 +36,7 @@ from .const import (
 )
 from .coordinator import FrameArtCoordinator
 from .activity import FrameArtActivitySensor
+from .binary_sensor import SIGNAL_TV_ACTUAL_STATE
 
 # Signal names for event-driven updates
 SIGNAL_BRIGHTNESS = f"{DOMAIN}_brightness_adjusted"  # {SIGNAL_BRIGHTNESS}_{entry_id}_{tv_id}
@@ -204,6 +205,18 @@ MATCHING_IMAGE_COUNT_DESCRIPTION = SensorEntityDescription(
     translation_key="shuffled_matching_images",
 )
 
+TV_ACTUAL_IMAGE_DESCRIPTION = SensorEntityDescription(
+    key="tv_actual_image",
+    icon="mdi:television-play",
+    translation_key="tv_actual_image",
+)
+
+TV_ACTUAL_MATTE_DESCRIPTION = SensorEntityDescription(
+    key="tv_actual_matte",
+    icon="mdi:image-filter-frames",
+    translation_key="tv_actual_matte",
+)
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -257,9 +270,12 @@ async def async_setup_entry(
             matching_count_entity = FrameArtMatchingImageCountEntity(hass, entry, tv_id)
             # Activity history sensor
             activity_entity = FrameArtActivitySensor(hass, entry, tv_id)
-            
-            tracked[tv_id] = (current_artwork_entity, last_image_entity, last_timestamp_entity, auto_shuffle_next_entity, ip_entity, mac_entity, motion_entity, light_entity, auto_bright_last_entity, auto_bright_next_entity, auto_bright_target_entity, auto_bright_lux_entity, auto_motion_last_entity, auto_motion_off_at_entity, current_matte_entity, current_filter_entity, matte_filter_entity, tags_combined_entity, selected_tagset_entity, selected_tagset_weighting_entity, override_tagset_entity, override_expiry_entity, matching_count_entity, activity_entity)
-            new_entities.extend([current_artwork_entity, last_image_entity, last_timestamp_entity, auto_shuffle_next_entity, ip_entity, mac_entity, motion_entity, light_entity, auto_bright_last_entity, auto_bright_next_entity, auto_bright_target_entity, auto_bright_lux_entity, auto_motion_last_entity, auto_motion_off_at_entity, current_matte_entity, current_filter_entity, matte_filter_entity, tags_combined_entity, selected_tagset_entity, selected_tagset_weighting_entity, override_tagset_entity, override_expiry_entity, matching_count_entity, activity_entity])
+            # Actual TV state sensors (polled directly from TV, not from shuffle cache)
+            tv_actual_image_entity = FrameArtTVActualImageEntity(hass, entry, tv_id)
+            tv_actual_matte_entity = FrameArtTVActualMatteEntity(hass, entry, tv_id)
+
+            tracked[tv_id] = (current_artwork_entity, last_image_entity, last_timestamp_entity, auto_shuffle_next_entity, ip_entity, mac_entity, motion_entity, light_entity, auto_bright_last_entity, auto_bright_next_entity, auto_bright_target_entity, auto_bright_lux_entity, auto_motion_last_entity, auto_motion_off_at_entity, current_matte_entity, current_filter_entity, matte_filter_entity, tags_combined_entity, selected_tagset_entity, selected_tagset_weighting_entity, override_tagset_entity, override_expiry_entity, matching_count_entity, activity_entity, tv_actual_image_entity, tv_actual_matte_entity)
+            new_entities.extend([current_artwork_entity, last_image_entity, last_timestamp_entity, auto_shuffle_next_entity, ip_entity, mac_entity, motion_entity, light_entity, auto_bright_last_entity, auto_bright_next_entity, auto_bright_target_entity, auto_bright_lux_entity, auto_motion_last_entity, auto_motion_off_at_entity, current_matte_entity, current_filter_entity, matte_filter_entity, tags_combined_entity, selected_tagset_entity, selected_tagset_weighting_entity, override_tagset_entity, override_expiry_entity, matching_count_entity, activity_entity, tv_actual_image_entity, tv_actual_matte_entity])
             
         if new_entities:
             async_add_entities(new_entities)
@@ -1660,4 +1676,127 @@ class FrameArtMatchingImageCountEntity(SensorEntity):
     @property
     def available(self) -> bool:  # type: ignore[override]
         """Return if entity is available."""
+        return get_tv_config(self._entry, self._tv_id) is not None
+
+
+class FrameArtTVActualImageEntity(SensorEntity):
+    """Sensor showing the image the TV is ACTUALLY displaying right now.
+
+    Polled every 30 s via get_current_artwork() — reflects the real TV state
+    regardless of what the shuffler last selected, including manual changes
+    made via the Samsung app or remote.
+    """
+
+    entity_description = TV_ACTUAL_IMAGE_DESCRIPTION
+    _attr_has_entity_name = True
+    _attr_name = "TV Actual Image"
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, tv_id: str) -> None:
+        self._hass = hass
+        self._entry = entry
+        self._tv_id = tv_id
+        self._attr_unique_id = f"{entry.entry_id}_{tv_id}_tv_actual_image"
+        self._unsubscribe: Callable[[], None] | None = None
+
+        tv_config = get_tv_config(entry, tv_id)
+        tv_name = tv_config.get("name", tv_id) if tv_config else tv_id
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, tv_id)},
+            name=tv_name,
+            manufacturer="Samsung",
+            model="Frame TV",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        @callback
+        def _updated() -> None:
+            self.async_write_ha_state()
+
+        self._unsubscribe = async_dispatcher_connect(
+            self._hass,
+            f"{SIGNAL_TV_ACTUAL_STATE}_{self._entry.entry_id}_{self._tv_id}",
+            _updated,
+        )
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._unsubscribe:
+            self._unsubscribe()
+            self._unsubscribe = None
+
+    @property
+    def native_value(self) -> str | None:
+        """Return the actual image filename (or content_id if unmapped)."""
+        data = self._hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
+        cache = data.get("tv_status_cache", {}).get(self._tv_id, {})
+        filename = cache.get("actual_filename")
+        if filename:
+            return filename
+        # Fall back to content_id so the sensor is never blank when the TV is on
+        return cache.get("actual_content_id")
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        data = self._hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
+        cache = data.get("tv_status_cache", {}).get(self._tv_id, {})
+        return {
+            "content_id": cache.get("actual_content_id"),
+            "matte": cache.get("actual_matte"),
+        }
+
+    @property
+    def available(self) -> bool:
+        return get_tv_config(self._entry, self._tv_id) is not None
+
+
+class FrameArtTVActualMatteEntity(SensorEntity):
+    """Sensor showing the matte the TV is ACTUALLY using right now.
+
+    Updated alongside FrameArtTVActualImageEntity from the same 30 s poll.
+    """
+
+    entity_description = TV_ACTUAL_MATTE_DESCRIPTION
+    _attr_has_entity_name = True
+    _attr_name = "TV Actual Matte"
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, tv_id: str) -> None:
+        self._hass = hass
+        self._entry = entry
+        self._tv_id = tv_id
+        self._attr_unique_id = f"{entry.entry_id}_{tv_id}_tv_actual_matte"
+        self._unsubscribe: Callable[[], None] | None = None
+
+        tv_config = get_tv_config(entry, tv_id)
+        tv_name = tv_config.get("name", tv_id) if tv_config else tv_id
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, tv_id)},
+            name=tv_name,
+            manufacturer="Samsung",
+            model="Frame TV",
+        )
+
+    async def async_added_to_hass(self) -> None:
+        @callback
+        def _updated() -> None:
+            self.async_write_ha_state()
+
+        self._unsubscribe = async_dispatcher_connect(
+            self._hass,
+            f"{SIGNAL_TV_ACTUAL_STATE}_{self._entry.entry_id}_{self._tv_id}",
+            _updated,
+        )
+
+    async def async_will_remove_from_hass(self) -> None:
+        if self._unsubscribe:
+            self._unsubscribe()
+            self._unsubscribe = None
+
+    @property
+    def native_value(self) -> str | None:
+        """Return the actual matte currently applied on the TV."""
+        data = self._hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
+        cache = data.get("tv_status_cache", {}).get(self._tv_id, {})
+        return cache.get("actual_matte")
+
+    @property
+    def available(self) -> bool:
         return get_tv_config(self._entry, self._tv_id) is not None

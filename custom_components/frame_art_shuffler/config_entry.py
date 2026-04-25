@@ -6,6 +6,107 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
 
+# ---------------------------------------------------------------------------
+# Content-ID map helpers
+#
+# Stores {tv_ip: {filename: content_id}} inside entry.data["content_id_maps"].
+# This is the authoritative persistent store — it survives HA snapshots and
+# restores.  The JSON file at /config/frame_art_shuffler/content_id_map.json
+# is kept as a fast synchronous cache used by executor-thread TV functions;
+# the two are kept in sync by bootstrap_content_id_map() (called on startup)
+# and by persist_content_id_entry() (called after every upload).
+# ---------------------------------------------------------------------------
+
+def get_content_id_map(entry: ConfigEntry, tv_ip: str) -> dict[str, str]:
+    """Return {filename: content_id} for a single TV IP, or empty dict."""
+    return entry.data.get("content_id_maps", {}).get(tv_ip, {})
+
+
+def get_all_content_id_maps(entry: ConfigEntry) -> dict[str, dict[str, str]]:
+    """Return the full {tv_ip: {filename: content_id}} mapping."""
+    return entry.data.get("content_id_maps", {})
+
+
+def upsert_content_id(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    tv_ip: str,
+    filename: str,
+    content_id: str,
+) -> None:
+    """Add or update a single filename→content_id mapping for a TV."""
+    data = {**entry.data}
+    maps = {k: dict(v) for k, v in data.get("content_id_maps", {}).items()}
+    maps.setdefault(tv_ip, {})[filename] = content_id
+    data["content_id_maps"] = maps
+    hass.config_entries.async_update_entry(entry, data=data)
+
+
+def remove_content_id(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    tv_ip: str,
+    filename: str,
+) -> bool:
+    """Remove a filename from the content_id map. Returns True if it existed."""
+    data = {**entry.data}
+    maps = {k: dict(v) for k, v in data.get("content_id_maps", {}).items()}
+    tv_map = maps.get(tv_ip, {})
+    if filename not in tv_map:
+        return False
+    del tv_map[filename]
+    maps[tv_ip] = tv_map
+    data["content_id_maps"] = maps
+    hass.config_entries.async_update_entry(entry, data=data)
+    return True
+
+
+def replace_content_id_map(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    tv_ip: str,
+    tv_map: dict[str, str],
+) -> None:
+    """Atomically replace the entire {filename: content_id} map for one TV.
+
+    Used by sync_tv_library to write a freshly-validated map in one shot.
+    """
+    data = {**entry.data}
+    maps = {k: dict(v) for k, v in data.get("content_id_maps", {}).items()}
+    maps[tv_ip] = dict(tv_map)
+    data["content_id_maps"] = maps
+    hass.config_entries.async_update_entry(entry, data=data)
+
+
+def bootstrap_content_id_map(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    json_map: dict[str, dict[str, str]],
+) -> None:
+    """Merge a JSON-file map into entry.data on startup.
+
+    Entry.data wins for any key that already exists there (it's the
+    authoritative store after first boot).  New keys from the JSON file
+    are added so existing installations migrate without data loss.
+    """
+    data = {**entry.data}
+    existing: dict[str, dict[str, str]] = {
+        k: dict(v) for k, v in data.get("content_id_maps", {}).items()
+    }
+
+    merged = False
+    for tv_ip, file_tv_map in json_map.items():
+        entry_tv_map = existing.setdefault(tv_ip, {})
+        for fname, cid in file_tv_map.items():
+            if fname not in entry_tv_map:
+                entry_tv_map[fname] = cid
+                merged = True
+
+    if merged or "content_id_maps" not in data:
+        data["content_id_maps"] = existing
+        hass.config_entries.async_update_entry(entry, data=data)
+
+
 def get_tv_config(entry: ConfigEntry, tv_id: str) -> dict[str, Any] | None:
     """Get TV configuration from config entry.
     
