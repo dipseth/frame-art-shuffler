@@ -992,10 +992,15 @@
         pressFn = null;
         return;
       }
-      // Treat as a click → positive toggle
+      // Treat as a click. In similar mode the click "scrolls right" by
+      // making this card the new target; outside similar mode it toggles
+      // the card as a positive for Discover context-building.
       if (wrap && pressFn) {
         const fn = wrap.dataset.filename || '';
-        if (fn === pressFn) togglePositive(fn);
+        if (fn === pressFn) {
+          if (similarTarget) runSimilar(fn);
+          else togglePositive(fn);
+        }
       }
       pressFn = null;
     }
