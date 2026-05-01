@@ -368,6 +368,12 @@
     .display-btn.sending { opacity: 0.5; cursor: wait; }
     .display-btn.sent    { background: var(--green); }
 
+    /* In similar mode the 👍/👎 buttons and discover context strip do nothing,
+       since /similar always sends empty positives/negatives to Qdrant. Hide
+       them so the UI doesn't suggest they affect the result set. */
+    body.similar-mode .vote-btn,
+    body.similar-mode #context-strip { display: none !important; }
+
     .vote-btn {
       width: 32px;
       padding: 6px 0;
@@ -704,6 +710,7 @@
     async function runSimilar(target) {
       if (!target) return;
       similarTarget = target;
+      document.body.classList.add('similar-mode');
       renderSimilarBanner();
       setStatus(`Finding similar to "${stemName(target)}"…`);
       document.getElementById('results').innerHTML = '';
@@ -760,6 +767,7 @@
 
     function clearSimilar() {
       similarTarget = null;
+      document.body.classList.remove('similar-mode');
       renderSimilarBanner();
       setStatus('');
     }
@@ -924,6 +932,10 @@
           btn.textContent = '✓ Sent';
           btn.classList.replace('sending', 'sent');
           showToast(`Displaying ${stemName(filename)}`, 'success');
+          // Loop: refresh the gallery around the image we just sent to the TV.
+          // Fires after the visual confirmation so the user sees the green tick
+          // before the page repaints.
+          setTimeout(() => runSimilar(filename), 600);
           setTimeout(() => {
             btn.textContent = 'Display';
             btn.classList.remove('sent');
