@@ -22,7 +22,7 @@ import websocket
 from . import exceptions, helper
 from .command import SamsungTVCommand
 from .connection import SamsungTVWSConnection
-from .event import D2D_SERVICE_MESSAGE_EVENT, MS_CHANNEL_READY_EVENT
+from .event import D2D_SERVICE_MESSAGE_EVENT, MS_CHANNEL_CLIENT_CONNECT_EVENT, MS_CHANNEL_READY_EVENT
 from .rest import SamsungTVRest
 from .helper import get_ssl_context
 
@@ -74,18 +74,31 @@ class SamsungTVArt(SamsungTVWSConnection):
     def open(self) -> websocket.WebSocket:
         super().open()
 
-        # Override base class to wait for MS_CHANNEL_READY_EVENT
+        # Override base class to wait for a connection-confirmation event.
+        #
+        # Newer Frame TV firmware (2022+) sends MS_CHANNEL_CLIENT_CONNECT_EVENT
+        # instead of MS_CHANNEL_READY_EVENT as the initial confirmation.
+        # When another client (e.g. HA integration) is already connected the TV
+        # may also send MS_CHANNEL_CLIENT_DISCONNECT_EVENT first (notifying that
+        # the previous session was bumped).  We loop past disconnect events and
+        # accept either ready/clientConnect as success.
         assert self.connection
-        data = self.connection.recv()
-        response = helper.process_api_response(data)
-        event = response.get("event", "*")
-        self._websocket_event(event, response)
+        _ACCEPTED = {MS_CHANNEL_READY_EVENT, MS_CHANNEL_CLIENT_CONNECT_EVENT}
+        _SKIP = {"ms.channel.clientDisconnect"}
+        last_response = None
+        for _ in range(5):
+            data = self.connection.recv()
+            response = helper.process_api_response(data)
+            event = response.get("event", "*")
+            self._websocket_event(event, response)
+            last_response = response
+            if event in _ACCEPTED:
+                return self.connection
+            if event not in _SKIP:
+                break  # unexpected event → fail
 
-        if event != MS_CHANNEL_READY_EVENT:
-            self.close()
-            raise exceptions.ConnectionFailure(response)
-
-        return self.connection
+        self.close()
+        raise exceptions.ConnectionFailure(last_response)
         
     def get_uuid(self):
         self.art_uuid = str(uuid.uuid4())
@@ -112,6 +125,15 @@ class SamsungTVArt(SamsungTVWSConnection):
                 sub_event = data.get("event", "*")
                 _LOGGING.debug('sub_event: {}, wait_for_event: {}'.format(sub_event, wait_for_event))
                 if sub_event == "error":
+                    # Log the full TV error payload before raising — by default
+                    # the exception only carries the bare error code, which on
+                    # 0.97 firmware is often something opaque like -11. The TV
+                    # may include description fields (error_msg, reason, etc.)
+                    # that are diagnostically useful but otherwise discarded.
+                    try:
+                        _LOGGING.warning("TV error response (full payload): %s", json.dumps(data, default=str))
+                    except Exception:  # pragma: no cover - defensive
+                        _LOGGING.warning("TV error response (repr): %r", data)
                     raise exceptions.ResponseError(
                         f"{json.loads(data['request_data'])['request']} request failed "
                         f"with error number {data['error_code']}"
@@ -344,13 +366,61 @@ class SamsungTVArt(SamsungTVWSConnection):
 
         return thumbnail_data_dict if as_dict else list(thumbnail_data_dict.values()) if len(content_id_list) > 1 else thumbnail_data
 
+    def _is_legacy_api(self) -> bool:
+        """Check if this TV uses the legacy v0.97 art API (2018/2019 models).
+
+        Legacy TVs do not support D2D socket uploads and require images to be
+        sent as WebSocket binary frames instead.
+        """
+        try:
+            version = self.get_api_version()
+            return version == "0.97"
+        except Exception:
+            return False
+
+    def _upload_ws_binary(self, file_data: bytes, *, upload_id: str, matte: str, file_type: str) -> Optional[str]:
+        """Upload via WebSocket binary frame (legacy v0.97 protocol).
+
+        2018/2019 Frame TVs reject the D2D socket ``send_image`` with error -1.
+        Instead they accept a single WebSocket binary frame containing:
+        ``2-byte header length (big-endian) + JSON header + raw image bytes``.
+        """
+        assert self.connection
+
+        ft = file_type.lower()
+        ft_header = "JPEG" if ft in ("jpg", "jpeg") else ft.upper()
+
+        inner = {
+            "request": "send_image",
+            "file_type": ft_header,
+            "matte_id": matte or "none",
+            "id": upload_id,
+        }
+
+        outer = {
+            "method": "ms.channel.emit",
+            "params": {
+                "data": json.dumps(inner),
+                "to": "host",
+                "event": "art_app_request",
+            },
+        }
+
+        header = json.dumps(outer, separators=(",", ":")).encode("utf-8")
+        payload = len(header).to_bytes(2, "big") + header + file_data
+        _LOGGING.info("Uploading %d bytes via WS binary frame (legacy v0.97)", len(file_data))
+        self.connection.send_binary(payload)
+
+        data = self.wait_for_response("image_added", upload_id)
+        return data["content_id"] if data else None
+
     def upload(self, file, matte="shadowbox_polar", portrait_matte="shadowbox_polar", file_type="png", date=None):
         if isinstance(file, str):
             file_name, file_extension = os.path.splitext(file)
             file_type = file_extension[1:]
             with open(file, 'rb') as f:
                 file = f.read()
-                
+
         file_size = len(file)
         file_type = file_type.lower()
         if file_type == "jpeg":
@@ -358,6 +428,14 @@ class SamsungTVArt(SamsungTVWSConnection):
 
         if date is None:
             date = datetime.now().strftime("%Y:%m:%d %H:%M:%S")
+
+        # Legacy v0.97 TVs (2018/2019 Frame) use WebSocket binary frames
+        # instead of the D2D socket handshake.
+        if self._is_legacy_api():
+            upload_id = self.get_uuid()
+            return self._upload_ws_binary(
+                file, upload_id=upload_id, matte=matte, file_type=file_type,
+            )
 
         data = self._send_art_request(
             {
@@ -392,7 +470,7 @@ class SamsungTVArt(SamsungTVWSConnection):
         )
 
         art_socket_raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        art_socket = get_ssl_context().wrap_socket(art_socket_raw) if conn_info.get('secured', False) else art_socket_raw  
+        art_socket = get_ssl_context().wrap_socket(art_socket_raw) if conn_info.get('secured', False) else art_socket_raw
         art_socket.connect((conn_info["ip"], int(conn_info["port"])))
         art_socket.send(len(header).to_bytes(4, "big"))
         art_socket.send(header.encode("ascii"))
@@ -471,7 +549,18 @@ class SamsungTVArt(SamsungTVWSConnection):
             {"request": "get_matte_list"}
         )
         assert data
-        return (json.loads(data["matte_type_list"]), json.loads(data.get("matte_color_list"))) if include_colour else json.loads(data["matte_type_list"])
+        # v0.97 TVs return matte info under different keys than newer firmware.
+        # Try the new-API keys first, fall back to the legacy key names.
+        type_key = "matte_type_list" if "matte_type_list" in data else "matte_list"
+        color_key = "matte_color_list" if "matte_color_list" in data else "color_list"
+        if type_key not in data:
+            _LOGGING.warning("get_matte_list: unexpected response keys %s", list(data.keys()))
+            return ([], []) if include_colour else []
+        matte_types = json.loads(data[type_key])
+        if include_colour:
+            matte_colors = json.loads(data[color_key]) if color_key in data else []
+            return matte_types, matte_colors
+        return matte_types
 
     def change_matte(self, content_id, matte_id=None, portrait_matte=None):
         '''

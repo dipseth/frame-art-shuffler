@@ -1,13 +1,13 @@
 {
   "domain": "frame_art_shuffler",
   "name": "Frame Art Shuffler",
-  "version": "0.2.0",
+  "version": "0.1.0+dev20260131142600",
   "documentation": "https://github.com/billywaldman/frame-art-shuffler",
   "codeowners": [
     "@billywaldman"
   ],
   "config_flow": true,
-  "requirements": [],
+  "requirements": ["qdrant-client>=1.7.0", "Pillow>=10.0.0", "watchdog>=3.0.0"],
   "iot_class": "local_polling",
   "issue_tracker": "https://github.com/billywaldman/frame-art-shuffler/issues"
 }

@@ -1,0 +1,900 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Frame Art Search</title>
+  <style>
+    :root {
+      --bg:         #111827;
+      --surface:    #1f2937;
+      --surface2:   #293548;
+      --border:     #374151;
+      --accent:     #6366f1;
+      --accent-dim: rgba(99,102,241,0.15);
+      --text:       #f9fafb;
+      --text-dim:   #9ca3af;
+      --green:      #10b981;
+      --amber:      #f59e0b;
+      --red:        #ef4444;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      padding: 16px;
+      min-height: 100vh;
+    }
+
+    /* ── Search bar ──────────────────────────────────────────── */
+    .toolbar {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 12px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    .search-wrap {
+      flex: 1;
+      min-width: 180px;
+      position: relative;
+    }
+    .search-wrap svg {
+      position: absolute;
+      left: 11px;
+      top: 50%;
+      transform: translateY(-50%);
+      width: 16px;
+      height: 16px;
+      color: var(--text-dim);
+      pointer-events: none;
+    }
+    #q {
+      width: 100%;
+      padding: 10px 12px 10px 34px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 14px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    #q:focus { border-color: var(--accent); }
+    #q::placeholder { color: var(--text-dim); }
+
+    #tv-selector,
+    #count-selector {
+      padding: 10px 12px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 13px;
+      outline: none;
+    }
+    #tv-selector { max-width: 180px; }
+    #count-selector { max-width: 110px; }
+    #tv-selector:focus,
+    #count-selector:focus { border-color: var(--accent); }
+
+    .search-btn {
+      padding: 10px 18px;
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: opacity 0.15s;
+    }
+    .search-btn:hover { opacity: 0.88; }
+    .search-btn:active { opacity: 0.75; }
+    .search-btn:disabled {
+      opacity: 0.4;
+      cursor: not-allowed;
+    }
+
+    /* ── Context strip ───────────────────────────────────────── */
+    #context-strip {
+      display: none;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 10px 12px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      margin-bottom: 12px;
+      font-size: 12px;
+    }
+    #context-strip.show { display: flex; }
+    #context-strip .label {
+      color: var(--text-dim);
+      font-weight: 600;
+      margin-right: 4px;
+    }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 6px 4px 4px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      font-size: 11px;
+      color: var(--text);
+      max-width: 260px;
+    }
+    .chip.target { border-color: var(--accent); }
+    .chip.positive { border-color: var(--green); }
+    .chip.negative { border-color: var(--red); }
+    .chip img {
+      width: 22px;
+      height: 22px;
+      object-fit: cover;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .chip .chip-text {
+      max-width: 160px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .chip .chip-x {
+      cursor: pointer;
+      color: var(--text-dim);
+      padding: 0 4px;
+      font-size: 14px;
+      line-height: 1;
+    }
+    .chip .chip-x:hover { color: var(--text); }
+    .chip .chip-icon {
+      flex-shrink: 0;
+      font-size: 12px;
+    }
+    #clear-ctx-btn {
+      margin-left: auto;
+      padding: 4px 10px;
+      background: transparent;
+      color: var(--text-dim);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font-size: 11px;
+      cursor: pointer;
+    }
+    #clear-ctx-btn:hover {
+      color: var(--text);
+      border-color: var(--text-dim);
+    }
+
+    /* ── Status line ─────────────────────────────────────────── */
+    #status {
+      font-size: 12px;
+      color: var(--text-dim);
+      margin-bottom: 12px;
+      min-height: 18px;
+    }
+    #status.error { color: var(--red); }
+
+    /* ── Results grid ────────────────────────────────────────── */
+    #results {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+      gap: 12px;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 2px solid var(--border);
+      border-radius: 10px;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      transition: border-color 0.15s, transform 0.1s;
+    }
+    .card:hover {
+      border-color: var(--accent);
+      transform: translateY(-1px);
+    }
+    .card.positive,
+    .card.positive:hover {
+      border-color: var(--green);
+      box-shadow: 0 0 0 1px var(--green) inset;
+    }
+    .card.negative,
+    .card.negative:hover {
+      border-color: var(--red);
+      box-shadow: 0 0 0 1px var(--red) inset;
+    }
+
+    .card-img-wrap {
+      position: relative;
+      width: 100%;
+      padding-top: 56.25%; /* 16:9 */
+      background: var(--surface2);
+      overflow: hidden;
+      cursor: pointer;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-touch-callout: none;
+    }
+    .card-img-wrap img {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+      object-fit: cover;
+      transition: opacity 0.2s;
+    }
+    .card-img-wrap img.loading { opacity: 0; }
+    .card-img-wrap img.loaded  { opacity: 1; }
+
+    /* score badge overlaid on image */
+    .score-badge {
+      position: absolute;
+      top: 6px;
+      right: 6px;
+      font-size: 10px;
+      font-weight: 700;
+      padding: 2px 6px;
+      border-radius: 4px;
+      letter-spacing: 0.02em;
+    }
+    .score-high { background: rgba(16,185,129,0.85); color: #fff; }
+    .score-mid  { background: rgba(245,158,11,0.85);  color: #fff; }
+    .score-low  { background: rgba(107,114,128,0.75); color: #fff; }
+
+    .card-body {
+      padding: 10px;
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+    .card-name {
+      font-size: 11px;
+      color: var(--text-dim);
+      word-break: break-all;
+      line-height: 1.35;
+    }
+    .card-name strong {
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 600;
+    }
+    .card-tags {
+      font-size: 11px;
+      color: var(--text-dim);
+      line-height: 1.4;
+      flex: 1;
+    }
+    .card-footer {
+      margin-top: 6px;
+      display: flex;
+      gap: 6px;
+    }
+    .display-btn {
+      flex: 1;
+      padding: 6px 0;
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: opacity 0.15s;
+    }
+    .display-btn:hover   { opacity: 0.88; }
+    .display-btn:active  { opacity: 0.7; }
+    .display-btn.sending { opacity: 0.5; cursor: wait; }
+    .display-btn.sent    { background: var(--green); }
+
+    .vote-btn {
+      width: 32px;
+      padding: 6px 0;
+      background: var(--surface2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font-size: 14px;
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    .vote-btn:hover { border-color: var(--text-dim); }
+    .vote-btn.active.pos {
+      background: var(--green);
+      border-color: var(--green);
+      color: #fff;
+    }
+    .vote-btn.active.neg {
+      background: var(--red);
+      border-color: var(--red);
+      color: #fff;
+    }
+
+    /* ── Empty / loading states ──────────────────────────────── */
+    .placeholder {
+      grid-column: 1 / -1;
+      text-align: center;
+      padding: 48px 0;
+      color: var(--text-dim);
+      font-size: 14px;
+    }
+    .placeholder svg {
+      width: 48px; height: 48px;
+      opacity: 0.3;
+      margin-bottom: 12px;
+      display: block;
+      margin-left: auto;
+      margin-right: auto;
+    }
+
+    /* ── Toast ───────────────────────────────────────────────── */
+    #toast {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 10px 16px;
+      font-size: 13px;
+      max-width: 300px;
+      opacity: 0;
+      transform: translateY(6px);
+      transition: opacity 0.25s, transform 0.25s;
+      pointer-events: none;
+      z-index: 100;
+    }
+    #toast.show {
+      opacity: 1;
+      transform: translateY(0);
+    }
+    #toast.success { border-color: var(--green); }
+    #toast.error   { border-color: var(--red); }
+  </style>
+</head>
+<body>
+
+  <div class="toolbar">
+    <div class="search-wrap">
+      <!-- search icon -->
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+      </svg>
+      <input id="q" type="text" autocomplete="off" spellcheck="false"
+             placeholder="Search artwork… pink flowers, winter landscape, abstract">
+    </div>
+
+    <select id="tv-selector">
+      <option value="">Loading TVs…</option>
+    </select>
+
+    <select id="count-selector" title="Number of results">
+      <option value="16" selected>16 results</option>
+      <option value="32">32 results</option>
+      <option value="64">64 results</option>
+      <option value="100">100 results</option>
+      <option value="200">200 results</option>
+    </select>
+
+    <button class="search-btn" id="search-btn" onclick="doSearch()">Search</button>
+  </div>
+
+  <div id="context-strip"></div>
+
+  <div id="status"></div>
+
+  <div id="results">
+    <div class="placeholder">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+        <rect x="3" y="3" width="18" height="18" rx="2"/>
+        <path d="M3 9h18M9 21V9"/>
+      </svg>
+      Type a description and press Search to find artwork
+    </div>
+  </div>
+
+  <div id="toast"></div>
+
+  <script>
+    const API = '/api/frame_art_shuffler';
+
+    // ── Helpers ──────────────────────────────────────────────────
+
+    function setStatus(msg, isError) {
+      const el = document.getElementById('status');
+      el.textContent = msg;
+      el.className = isError ? 'error' : '';
+    }
+
+    function showToast(msg, type) {
+      const t = document.getElementById('toast');
+      t.textContent = msg;
+      t.className = 'show ' + (type || '');
+      clearTimeout(t._timer);
+      t._timer = setTimeout(() => { t.className = ''; }, 3000);
+    }
+
+    function scoreClass(s) {
+      if (s >= 0.30) return 'score-high';
+      if (s >= 0.18) return 'score-mid';
+      return 'score-low';
+    }
+
+    function stemName(filename) {
+      return (filename || '').replace(/\.[^.]+$/, '').replace(/[-_]/g, ' ');
+    }
+
+    // ── Discovery context ────────────────────────────────────────
+
+    const context = { positives: [], negatives: [] };
+
+    function togglePositive(fn) {
+      if (!fn) return;
+      const i = context.positives.indexOf(fn);
+      if (i >= 0) {
+        context.positives.splice(i, 1);
+      } else {
+        // Remove from negatives if present, add to positives
+        const j = context.negatives.indexOf(fn);
+        if (j >= 0) context.negatives.splice(j, 1);
+        context.positives.push(fn);
+      }
+      onContextChange();
+    }
+
+    function toggleNegative(fn) {
+      if (!fn) return;
+      const i = context.negatives.indexOf(fn);
+      if (i >= 0) {
+        context.negatives.splice(i, 1);
+      } else {
+        const j = context.positives.indexOf(fn);
+        if (j >= 0) context.positives.splice(j, 1);
+        context.negatives.push(fn);
+      }
+      onContextChange();
+    }
+
+    function clearContext() {
+      context.positives = [];
+      context.negatives = [];
+      onContextChange();
+    }
+
+    function onContextChange() {
+      renderContextStrip();
+      restyleCards();
+      updateSearchButton();
+    }
+
+    function restyleCards() {
+      document.querySelectorAll('.card').forEach(card => {
+        const fn = card.dataset.filename || '';
+        card.classList.remove('positive', 'negative');
+        if (context.positives.includes(fn)) card.classList.add('positive');
+        else if (context.negatives.includes(fn)) card.classList.add('negative');
+
+        card.querySelectorAll('.vote-btn').forEach(btn => {
+          const isPos = btn.dataset.vote === 'pos';
+          const active = isPos
+            ? context.positives.includes(fn)
+            : context.negatives.includes(fn);
+          btn.classList.toggle('active', active);
+          btn.classList.toggle('pos', isPos && active);
+          btn.classList.toggle('neg', !isPos && active);
+        });
+      });
+    }
+
+    function chipImg(fn) {
+      const src = `/local/frame_art/library/${encodeURIComponent(fn)}`;
+      return `<img src="${escAttr(src)}" alt="">`;
+    }
+
+    function renderContextStrip() {
+      const strip = document.getElementById('context-strip');
+      const q = document.getElementById('q').value.trim();
+      const hasCtx = context.positives.length || context.negatives.length;
+
+      if (!hasCtx) {
+        strip.classList.remove('show');
+        strip.innerHTML = '';
+        return;
+      }
+
+      // Determine target: text query if non-empty, else first positive
+      let targetChip = '';
+      let posOffset = 0;
+      if (q) {
+        targetChip = `<span class="chip target"><span class="chip-icon">🎯</span><span class="chip-text">"${escHtml(q)}"</span></span>`;
+      } else if (context.positives.length) {
+        const tfn = context.positives[0];
+        targetChip = `
+          <span class="chip target">
+            <span class="chip-icon">🎯</span>
+            ${chipImg(tfn)}
+            <span class="chip-text">${escHtml(tfn)}</span>
+            <span class="chip-x" data-remove="pos" data-filename="${escAttr(tfn)}">×</span>
+          </span>`;
+        posOffset = 1;
+      }
+
+      const posChips = context.positives.slice(posOffset).map(fn => `
+        <span class="chip positive">
+          👍 ${chipImg(fn)}
+          <span class="chip-text">${escHtml(fn)}</span>
+          <span class="chip-x" data-remove="pos" data-filename="${escAttr(fn)}">×</span>
+        </span>`).join('');
+
+      const negChips = context.negatives.map(fn => `
+        <span class="chip negative">
+          👎 ${chipImg(fn)}
+          <span class="chip-text">${escHtml(fn)}</span>
+          <span class="chip-x" data-remove="neg" data-filename="${escAttr(fn)}">×</span>
+        </span>`).join('');
+
+      strip.innerHTML = `
+        <span class="label">Selected (${context.positives.length + context.negatives.length}):</span>
+        ${targetChip}${posChips}${negChips}
+        <button id="clear-ctx-btn" type="button">Clear</button>`;
+      strip.classList.add('show');
+    }
+
+    function updateSearchButton() {
+      const btn = document.getElementById('search-btn');
+      const q = document.getElementById('q').value.trim();
+      const ctxCount = context.positives.length + context.negatives.length;
+
+      let enabled = false;
+      let reason = '';
+      if (q) {
+        enabled = true;
+      } else if (ctxCount === 0) {
+        reason = 'Type a query or select images';
+      } else if (context.positives.length < 2) {
+        reason = 'Add at least 2 positives, or include a text query';
+      } else if (ctxCount < 3) {
+        reason = 'Add at least 3 images total';
+      } else {
+        enabled = true;
+      }
+
+      btn.disabled = !enabled;
+      btn.title = enabled ? '' : reason;
+    }
+
+    // ── TV selector ──────────────────────────────────────────────
+
+    async function loadTVs() {
+      try {
+        const r = await fetch(`${API}/search_config`);
+        const data = await r.json();
+        const sel = document.getElementById('tv-selector');
+        if (data.tvs && data.tvs.length > 0) {
+          sel.innerHTML = data.tvs
+            .map(tv => `<option value="${escHtml(tv.tv_id)}">${escHtml(tv.name)}</option>`)
+            .join('');
+        } else {
+          sel.innerHTML = '<option value="">No TVs found</option>';
+        }
+      } catch (e) {
+        document.getElementById('tv-selector').innerHTML =
+          '<option value="">Error loading TVs</option>';
+      }
+    }
+
+    // ── Search ───────────────────────────────────────────────────
+
+    async function doSearch() {
+      const q = document.getElementById('q').value.trim();
+      const hasCtx = context.positives.length || context.negatives.length;
+
+      if (!q && !hasCtx) return;
+
+      if (hasCtx) {
+        return runDiscoverSearch(q);
+      }
+      return runTextSearch(q);
+    }
+
+    function fadeInImages() {
+      document.querySelectorAll('.card-img-wrap img').forEach(img => {
+        img.classList.add('loading');
+        img.onload  = () => img.classList.replace('loading', 'loaded');
+        img.onerror = () => { img.classList.replace('loading', 'loaded'); img.alt = ''; };
+      });
+    }
+
+    async function runTextSearch(q) {
+      setStatus('Searching…');
+      document.getElementById('results').innerHTML = '';
+
+      try {
+        const topK = document.getElementById('count-selector').value || '16';
+        const r = await fetch(`${API}/search?q=${encodeURIComponent(q)}&top_k=${encodeURIComponent(topK)}`);
+        const data = await r.json();
+
+        if (data.error) {
+          setStatus('Error: ' + data.error, true);
+          return;
+        }
+
+        const results = data.results || [];
+        if (results.length === 0) {
+          setStatus(`No results for "${q}"`);
+          document.getElementById('results').innerHTML =
+            '<div class="placeholder">No images matched that description.</div>';
+          return;
+        }
+
+        setStatus(`${results.length} results for "${q}"`);
+        document.getElementById('results').innerHTML = results.map(buildCard).join('');
+        fadeInImages();
+      } catch (e) {
+        setStatus('Search failed: ' + e.message, true);
+      }
+    }
+
+    async function runDiscoverSearch(q) {
+      setStatus('Discovering…');
+      document.getElementById('results').innerHTML = '';
+
+      const topK = parseInt(document.getElementById('count-selector').value || '16', 10);
+      const body = {
+        text_query: q || null,
+        positives: [...context.positives],
+        negatives: [...context.negatives],
+        top_k: topK,
+      };
+
+      try {
+        const r = await fetch(`${API}/discover`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const data = await r.json();
+
+        if (!r.ok || data.error) {
+          setStatus('Error: ' + (data.error || r.statusText), true);
+          return;
+        }
+
+        const results = data.results || [];
+        const targetDesc = q
+          ? `target: "${q}"`
+          : `target: ${context.positives[0] || '?'}`;
+        const summary = `${targetDesc} • ${context.positives.length}👍 • ${context.negatives.length}👎`;
+
+        if (results.length === 0) {
+          setStatus(`No results — ${summary}`);
+          document.getElementById('results').innerHTML =
+            '<div class="placeholder">No images matched the discovery context.</div>';
+          return;
+        }
+
+        setStatus(`${results.length} results — ${summary}`);
+        document.getElementById('results').innerHTML = results.map(buildCard).join('');
+        fadeInImages();
+      } catch (e) {
+        setStatus('Discover failed: ' + e.message, true);
+      }
+    }
+
+    function buildCard(item) {
+      const fn    = item.filename || '';
+      const score = item.score || 0;
+      const tags  = (item.tags || []).slice(0, 5).join(', ');
+      const matte = (item.matte && item.matte !== 'none') ? item.matte : '';
+
+      const imgSrc = `/local/frame_art/library/${encodeURIComponent(fn)}`;
+      const pct    = Math.round(score * 100);
+      const scCls  = scoreClass(score);
+
+      const isPos = context.positives.includes(fn);
+      const isNeg = context.negatives.includes(fn);
+      const cardCls = isPos ? 'card positive' : isNeg ? 'card negative' : 'card';
+      const posCls  = isPos ? 'vote-btn active pos' : 'vote-btn';
+      const negCls  = isNeg ? 'vote-btn active neg' : 'vote-btn';
+
+      return `
+        <div class="${cardCls}" data-filename="${escAttr(fn)}">
+          <div class="card-img-wrap" data-filename="${escAttr(fn)}">
+            <img src="${escAttr(imgSrc)}" alt="${escAttr(fn)}" draggable="false">
+            <span class="score-badge ${scCls}">${pct}%</span>
+          </div>
+          <div class="card-body">
+            <div class="card-name">
+              <strong>${escHtml(stemName(fn))}</strong><br>${escHtml(fn)}
+            </div>
+            ${tags ? `<div class="card-tags">${escHtml(tags)}${matte ? ' · ' + escHtml(matte) : ''}</div>` : ''}
+            <div class="card-footer">
+              <button class="${posCls}" data-vote="pos" data-filename="${escAttr(fn)}" title="More like this">👍</button>
+              <button class="${negCls}" data-vote="neg" data-filename="${escAttr(fn)}" title="Less like this">👎</button>
+              <button class="display-btn" data-filename="${escAttr(fn)}">
+                Display
+              </button>
+            </div>
+          </div>
+        </div>`;
+    }
+
+    // ── Display ──────────────────────────────────────────────────
+
+    async function displayImage(btn, filename) {
+      const tvId = document.getElementById('tv-selector').value;
+      if (!tvId) {
+        showToast('Select a TV first', 'error');
+        return;
+      }
+
+      btn.classList.add('sending');
+      btn.disabled = true;
+
+      try {
+        const r = await fetch(`${API}/display`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tv_id: tvId, filename }),
+        });
+
+        if (r.ok) {
+          btn.textContent = '✓ Sent';
+          btn.classList.replace('sending', 'sent');
+          showToast(`Displaying ${stemName(filename)}`, 'success');
+          setTimeout(() => {
+            btn.textContent = 'Display';
+            btn.classList.remove('sent');
+            btn.disabled = false;
+          }, 2500);
+        } else {
+          const err = await r.text();
+          showToast('Error: ' + err, 'error');
+          btn.classList.remove('sending');
+          btn.disabled = false;
+        }
+      } catch (e) {
+        showToast('Failed: ' + e.message, 'error');
+        btn.classList.remove('sending');
+        btn.disabled = false;
+      }
+    }
+
+    // ── XSS helpers ──────────────────────────────────────────────
+
+    function escHtml(s) {
+      return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+    function escAttr(s) { return escHtml(s); }
+
+    // ── Card interaction: click = positive, long-press / right-click = negative
+
+    const LONG_PRESS_MS = 500;
+    let pressTimer = null;
+    let pressFn = null;
+    let longPressFired = false;
+
+    function clearPressTimer() {
+      if (pressTimer) {
+        clearTimeout(pressTimer);
+        pressTimer = null;
+      }
+    }
+
+    function onCardPointerDown(e) {
+      const wrap = e.target.closest('.card-img-wrap');
+      if (!wrap) return;
+      // Only start press timer for primary button (left-click / touch)
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+
+      pressFn = wrap.dataset.filename || '';
+      longPressFired = false;
+      clearPressTimer();
+      pressTimer = setTimeout(() => {
+        longPressFired = true;
+        pressTimer = null;
+        if (pressFn) toggleNegative(pressFn);
+      }, LONG_PRESS_MS);
+    }
+
+    function onCardPointerUp(e) {
+      const wrap = e.target.closest('.card-img-wrap');
+      clearPressTimer();
+      // If long-press already fired, suppress the click
+      if (longPressFired) {
+        longPressFired = false;
+        pressFn = null;
+        return;
+      }
+      // Treat as a click → positive toggle
+      if (wrap && pressFn) {
+        const fn = wrap.dataset.filename || '';
+        if (fn === pressFn) togglePositive(fn);
+      }
+      pressFn = null;
+    }
+
+    function onCardPointerCancel() {
+      clearPressTimer();
+      pressFn = null;
+      longPressFired = false;
+    }
+
+    // ── Init ─────────────────────────────────────────────────────
+
+    document.getElementById('q').addEventListener('keydown', e => {
+      if (e.key === 'Enter') doSearch();
+    });
+    document.getElementById('q').addEventListener('input', () => {
+      renderContextStrip();
+      updateSearchButton();
+    });
+
+    const resultsEl = document.getElementById('results');
+
+    resultsEl.addEventListener('click', e => {
+      // Display button
+      const dbtn = e.target.closest('.display-btn');
+      if (dbtn) {
+        const fn = dbtn.dataset.filename || '';
+        if (fn) displayImage(dbtn, fn);
+        return;
+      }
+      // Vote buttons
+      const vbtn = e.target.closest('.vote-btn');
+      if (vbtn) {
+        const fn = vbtn.dataset.filename || '';
+        if (vbtn.dataset.vote === 'pos') togglePositive(fn);
+        else toggleNegative(fn);
+      }
+    });
+
+    // Card image: click = positive, long-press / right-click = negative
+    resultsEl.addEventListener('pointerdown', onCardPointerDown);
+    resultsEl.addEventListener('pointerup', onCardPointerUp);
+    resultsEl.addEventListener('pointerleave', onCardPointerCancel, true);
+    resultsEl.addEventListener('pointercancel', onCardPointerCancel);
+    resultsEl.addEventListener('contextmenu', e => {
+      const wrap = e.target.closest('.card-img-wrap');
+      if (!wrap) return;
+      e.preventDefault();
+      clearPressTimer();
+      longPressFired = true;  // suppress the synthetic click that may follow
+      const fn = wrap.dataset.filename || '';
+      if (fn) toggleNegative(fn);
+    });
+
+    // Context strip: chip removal + clear button
+    document.getElementById('context-strip').addEventListener('click', e => {
+      if (e.target.id === 'clear-ctx-btn') {
+        clearContext();
+        return;
+      }
+      const x = e.target.closest('.chip-x');
+      if (!x) return;
+      const fn = x.dataset.filename || '';
+      const list = x.dataset.remove === 'pos' ? context.positives : context.negatives;
+      const i = list.indexOf(fn);
+      if (i >= 0) list.splice(i, 1);
+      onContextChange();
+    });
+
+    updateSearchButton();
+    loadTVs();
+  </script>
+</body>
+</html>

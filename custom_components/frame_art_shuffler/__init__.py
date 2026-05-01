@@ -16,6 +16,7 @@ import importlib
 import importlib.util
 import functools
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -85,15 +86,21 @@ if _HA_AVAILABLE:
     )
     from .display_log import DisplayLogManager
     from .coordinator import FrameArtCoordinator
-    from .config_entry import get_tv_config, get_global_tagsets, list_tv_configs, remove_tv_config, update_tv_config, update_global_tagsets, get_effective_tags
+    from .config_entry import (
+        get_tv_config, get_global_tagsets, list_tv_configs, remove_tv_config,
+        update_tv_config, update_global_tagsets, get_effective_tags,
+        bootstrap_content_id_map, upsert_content_id, remove_content_id,
+        replace_content_id_map, get_content_id_map, get_all_content_id_maps,
+    )
+    from .frame_tv import _load_content_map as _load_content_id_json
     from . import frame_tv
-    from .frame_tv import TOKEN_DIR as DEFAULT_TOKEN_DIR, set_token_directory, tv_on, tv_off, set_art_mode, is_screen_on
+    from .frame_tv import TOKEN_DIR as DEFAULT_TOKEN_DIR, set_token_directory, tv_on, tv_off, set_art_mode, is_screen_on, is_art_mode_enabled
     from .metadata import MetadataStore
     from .dashboard import async_generate_dashboard
     from .activity import log_activity
     from .shuffle import async_guarded_upload, async_shuffle_tv
 
-    PLATFORMS = [Platform.NUMBER, Platform.BUTTON, Platform.SENSOR, Platform.SWITCH, Platform.BINARY_SENSOR]
+    PLATFORMS = [Platform.NUMBER, Platform.BUTTON, Platform.SENSOR, Platform.SWITCH, Platform.BINARY_SENSOR, Platform.IMAGE]
 else:
     DEFAULT_TOKEN_DIR = Path(__file__).resolve().parent / "tokens"
     PLATFORMS: list[Any] = []
@@ -364,7 +371,6 @@ if _HA_AVAILABLE:
             "shuffle_cache": {},
             "upload_in_progress": set(),
             "auto_shuffle_next_times": {},
-            "tv_mode_active": set(),
         }
 
         display_log = DisplayLogManager(hass, entry)
@@ -485,17 +491,55 @@ if _HA_AVAILABLE:
                     f"Displaying custom image ({display_filename}) via service call",
                 )
 
-                await hass.async_add_executor_job(
+                returned_content_id = await hass.async_add_executor_job(
                     functools.partial(
-                        frame_tv.set_art_on_tv_deleteothers,
+                        frame_tv.display_art,
                         ip,
                         final_path,
                         mac_address=mac,
                         matte=matte,
                         photo_filter=filter_id,
-                        delete_others=True,
                     )
                 )
+
+                # Persist the content_id mapping to entry.data so it survives
+                # snapshots and is visible without reading the JSON file.
+                if returned_content_id and filename:
+                    upsert_content_id(hass, target_entry, ip, filename, returned_content_id)
+
+                # Keep Qdrant in sync. Non-fatal: failures must not break TV uploads.
+                qdrant_store = data.get("qdrant_store")
+                if qdrant_store and filename:
+                    try:
+                        existing = await hass.async_add_executor_job(
+                            qdrant_store.find_by_filename, filename
+                        )
+                        if existing is None:
+                            meta_store = MetadataStore(data["metadata_path"])
+                            image_meta = (
+                                await hass.async_add_executor_job(
+                                    meta_store.get_image, filename
+                                )
+                            ) or {}
+                            await hass.async_add_executor_job(
+                                functools.partial(
+                                    qdrant_store.upsert_image,
+                                    filename,
+                                    tags=list(image_meta.get("tags", [])),
+                                    matte=image_meta.get("matte"),
+                                    filter_type=image_meta.get("filter"),
+                                    width=image_meta.get("width"),
+                                    height=image_meta.get("height"),
+                                    image_path=Path(final_path) if final_path else None,
+                                )
+                            )
+                        if returned_content_id:
+                            await hass.async_add_executor_job(
+                                qdrant_store.update_content_id,
+                                filename, ip, returned_content_id,
+                            )
+                    except Exception as qerr:  # noqa: BLE001
+                        _LOGGER.debug("Qdrant sync skipped for %s: %s", filename, qerr)
 
                 # Update shuffle_cache with all current state (like shuffle does)
                 # This ensures the dashboard sensors show the correct image/matte/filter
@@ -540,6 +584,8 @@ if _HA_AVAILABLE:
                         started_at=datetime.now(dt_timezone.utc),
                         matte=matte,
                     )
+                    # Flush immediately to persist - don't wait for periodic flush
+                    await display_log.async_flush(force=True)
 
                 return True
 
@@ -1239,6 +1285,215 @@ if _HA_AVAILABLE:
             async_handle_set_recency_windows,
         )
 
+        # ------------------------------------------------------------------ #
+        # sync_tv_library service
+        # ------------------------------------------------------------------ #
+        async def async_handle_sync_tv_library(call: ServiceCall) -> None:
+            """Query TV gallery and reconcile with local content_id_map.
+
+            - Removes stale map entries (filename mapped but not on TV)
+            - Discovers new content IDs by dimension-matching against metadata.json
+            - Writes reconciled map to both entry.data and the JSON cache
+            """
+            from .frame_tv import _get_tv_content_ids, _save_content_map
+
+            for tv_id, tv_config in list_tv_configs(entry).items():
+                ip = tv_config.get("ip")
+                if not ip:
+                    continue
+                tv_name = tv_config.get("name", tv_id)
+                _LOGGER.info("sync_tv_library: querying TV %s (%s)", tv_name, ip)
+
+                try:
+                    on_tv: dict[str, dict] = await hass.async_add_executor_job(
+                        _get_tv_content_ids, ip
+                    )
+                except Exception as _err:
+                    _LOGGER.warning("sync_tv_library: could not query %s: %s", tv_name, _err)
+                    log_activity(hass, entry.entry_id, tv_id, "sync_tv_library",
+                                 f"Sync failed: could not query TV — {_err}")
+                    continue
+
+                on_tv_ids: set[str] = set(on_tv.keys())
+                current_map: dict[str, str] = dict(get_content_id_map(entry, ip))
+
+                # --- remove stale entries (content_id no longer on TV) ---
+                stale = [f for f, cid in current_map.items() if cid not in on_tv_ids]
+                for fname in stale:
+                    del current_map[fname]
+                    _LOGGER.info("sync_tv_library: removed stale mapping %s from %s", fname, tv_name)
+
+                # --- discover unknown content IDs via dimension matching ---
+                mapped_ids = set(current_map.values())
+                unknown_ids = on_tv_ids - mapped_ids
+                discovered = 0
+
+                if unknown_ids:
+                    try:
+                        data_store = hass.data[DOMAIN][entry.entry_id]
+                        meta_path: Path = data_store["metadata_path"]
+                        import json as _json
+                        with open(meta_path, "r", encoding="utf-8") as _f:
+                            _meta = _json.load(_f)
+                        lib_images = _meta.get("images", {})
+                    except Exception:
+                        lib_images = {}
+
+                    # Build dimension lookup: (width, height) → [filename, ...]
+                    dim_lookup: dict[tuple, list[str]] = {}
+                    for _fname, _info in lib_images.items():
+                        if _fname in current_map:
+                            continue  # already mapped
+                        dims = _info.get("dimensions") or {}
+                        w, h = dims.get("width"), dims.get("height")
+                        if w and h:
+                            dim_lookup.setdefault((w, h), []).append(_fname)
+                        # Also check aspect ratio for softer match
+                        ar = _info.get("aspectRatio")
+                        if ar:
+                            dim_lookup.setdefault(("ar", round(ar, 2)), []).append(_fname)
+
+                    for cid in unknown_ids:
+                        tv_img = on_tv.get(cid, {})
+                        w, h = tv_img.get("width"), tv_img.get("height")
+                        matched: str | None = None
+
+                        # Exact dimension match
+                        if w and h:
+                            candidates = dim_lookup.get((w, h), [])
+                            if len(candidates) == 1:
+                                matched = candidates[0]
+
+                        # Aspect ratio match as fallback (only if unique)
+                        if not matched and w and h:
+                            ar_key = ("ar", round(w / h, 2))
+                            candidates = dim_lookup.get(ar_key, [])
+                            if len(candidates) == 1:
+                                matched = candidates[0]
+
+                        if matched:
+                            current_map[matched] = cid
+                            discovered += 1
+                            _LOGGER.info(
+                                "sync_tv_library: discovered %s → %s on %s",
+                                matched, cid, tv_name,
+                            )
+                            # Also write to metadata.json tvContentIds
+                            try:
+                                from .metadata import MetadataStore
+                                await hass.async_add_executor_job(
+                                    MetadataStore(meta_path).update_image_content_id,
+                                    matched, ip, cid,
+                                )
+                            except Exception:
+                                pass
+                        else:
+                            _LOGGER.info(
+                                "sync_tv_library: %s on %s has no library match (w=%s h=%s)",
+                                cid, tv_name, w, h,
+                            )
+
+                # Persist reconciled map to both stores
+                replace_content_id_map(hass, entry, ip, current_map)
+                await hass.async_add_executor_job(
+                    _save_content_map, {ip: current_map}
+                )
+
+                msg = (
+                    f"Sync complete: {len(current_map)} mapped, "
+                    f"{len(stale)} stale removed, {discovered} discovered, "
+                    f"{len(unknown_ids) - discovered} still unknown"
+                )
+                _LOGGER.info("sync_tv_library (%s): %s", tv_name, msg)
+                log_activity(hass, entry.entry_id, tv_id, "sync_tv_library", msg)
+
+        hass.services.async_register(DOMAIN, "sync_tv_library", async_handle_sync_tv_library)
+
+        # ------------------------------------------------------------------ #
+        # remove_image service
+        # ------------------------------------------------------------------ #
+        async def async_handle_remove_image(call: ServiceCall) -> None:
+            """Remove an image from all TV content_id maps.
+
+            Called by the Frame Art Manager when an image is deleted from the
+            library, so the map stays in sync without manual editing.
+
+            Service data:
+              filename (str): the image filename (e.g. "cherry_blossoms.jpg")
+              delete_from_tv (bool, optional): if True, also delete from TV gallery
+            """
+            filename: str = call.data.get("filename", "")
+            delete_from_tv: bool = bool(call.data.get("delete_from_tv", False))
+
+            if not filename:
+                raise ValueError("remove_image: 'filename' is required")
+
+            from .frame_tv import _get_tv_content_ids, _save_content_map
+
+            removed_from_maps = 0
+            removed_from_tv = 0
+            for tv_id, tv_config in list_tv_configs(entry).items():
+                ip = tv_config.get("ip")
+                if not ip:
+                    continue
+                tv_name = tv_config.get("name", tv_id)
+                cid = get_content_id_map(entry, ip).get(filename)
+                if not cid:
+                    continue
+
+                # Remove from entry.data and JSON file
+                remove_content_id(hass, entry, ip, filename)
+                current_json = await hass.async_add_executor_job(
+                    lambda: __import__('json').loads(
+                        __import__('pathlib').Path(
+                            '/config/frame_art_shuffler/content_id_map.json'
+                        ).read_text()
+                    ) if __import__('pathlib').Path('/config/frame_art_shuffler/content_id_map.json').exists() else {}
+                )
+                if ip in current_json and filename in current_json[ip]:
+                    del current_json[ip][filename]
+                    await hass.async_add_executor_job(_save_content_map, current_json)
+                removed_from_maps += 1
+                _LOGGER.info("remove_image: removed %s (%s) from map for %s", filename, cid, tv_name)
+
+                if delete_from_tv and cid:
+                    try:
+                        from .samsungtvws.remote import SamsungTVWS
+                        from .frame_tv import TOKEN_DIR
+
+                        def _delete_from_tv() -> None:
+                            token_file = TOKEN_DIR / f"{ip.replace('.', '_')}.token"
+                            tv = SamsungTVWS(host=ip, port=8002, token_file=str(token_file), timeout=10)
+                            art = tv.art()
+                            art.delete(cid)
+                            tv.close()
+
+                        await hass.async_add_executor_job(_delete_from_tv)
+                        removed_from_tv += 1
+                        _LOGGER.info("remove_image: deleted %s from TV %s", cid, tv_name)
+                    except Exception as _del_err:
+                        _LOGGER.warning("remove_image: could not delete %s from TV %s: %s", cid, tv_name, _del_err)
+
+                log_activity(
+                    hass, entry.entry_id, tv_id, "remove_image",
+                    f"Removed {filename} from content map"
+                    + (f" and TV gallery ({cid})" if removed_from_tv else ""),
+                )
+
+            if removed_from_maps == 0:
+                _LOGGER.info("remove_image: %s not found in any TV map", filename)
+
+            # Also drop the Qdrant point so search no longer returns the image.
+            qdrant_store = hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("qdrant_store")
+            if qdrant_store:
+                try:
+                    await hass.async_add_executor_job(qdrant_store.remove_image, filename)
+                    _LOGGER.info("remove_image: removed %s from Qdrant", filename)
+                except Exception as qerr:  # noqa: BLE001
+                    _LOGGER.debug("Qdrant remove skipped for %s: %s", filename, qerr)
+
+        hass.services.async_register(DOMAIN, "remove_image", async_handle_remove_image)
+
         # Per-TV auto brightness timer management
         auto_brightness_timers: dict[str, Callable[[], None]] = {}
         # Use the dict already initialized in hass.data so sensors can access it
@@ -1670,6 +1925,25 @@ if _HA_AVAILABLE:
                 )
                 return
 
+            # Check if TV is actually in art mode (not playing TV content)
+            # PowerState "on" is reported for both art mode and regular TV usage,
+            # so we need the Art WebSocket API to distinguish the two.
+            tv_ip = tv_config.get("ip")
+            if tv_ip:
+                try:
+                    art_mode = await hass.async_add_executor_job(is_art_mode_enabled, tv_ip)
+                    if art_mode is False:
+                        log_activity(
+                            hass,
+                            entry.entry_id,
+                            tv_id,
+                            "shuffle_skipped",
+                            "Auto shuffle skipped: TV not in art mode",
+                        )
+                        return
+                except Exception:  # pylint: disable=broad-except
+                    pass  # If check fails, proceed with shuffle
+
             # Check if override is active - skip recency during overrides
             # (user deliberately chose a different tagset, don't constrain their pool)
             has_override = tv_config.get("override_tagset")
@@ -1799,15 +2073,6 @@ if _HA_AVAILABLE:
             if not tv_config:
                 return
 
-            # Don't start the off timer if TV mode is active (auto-shuffle
-            # toggled off via switch).  The user is watching TV and shouldn't
-            # be interrupted by an auto-turn-off.  Motion wake still works.
-            tv_mode_tvs = hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("tv_mode_active", set())
-            if tv_id in tv_mode_tvs:
-                tv_name = tv_config.get("name", tv_id)
-                _LOGGER.debug("Auto motion: Skipping off timer for %s (TV mode active)", tv_name)
-                return
-
             # If this is a reschedule due to upload-in-progress, use short delay
             # Otherwise use the configured off_delay_minutes
             if reschedule_count > 0:
@@ -1829,15 +2094,6 @@ if _HA_AVAILABLE:
                 tv_configs = list_tv_configs(entry)
                 tv_config = tv_configs.get(tv_id)
                 if not tv_config or not tv_config.get("enable_motion_control", False):
-                    cancel_motion_off_timer(tv_id)
-                    return
-
-                # Safety net: don't turn off if TV mode was activated after
-                # the timer was started.
-                tv_mode_tvs = hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("tv_mode_active", set())
-                if tv_id in tv_mode_tvs:
-                    tv_name = tv_config.get("name", tv_id)
-                    _LOGGER.info("Auto motion: Skipping turn-off for %s (TV mode active)", tv_name)
                     cancel_motion_off_timer(tv_id)
                     return
 
@@ -1872,10 +2128,74 @@ if _HA_AVAILABLE:
                         return
 
                 try:
+                    # Motion gate: if any configured sensor currently reads "on",
+                    # motion is still active — reschedule regardless of TV mode.
+                    # The listener only fires on off→on transitions, so a sensor
+                    # that stays continuously "on" never refreshes motion_cache;
+                    # this gate is what catches that case and also guards against
+                    # a cancel/fire race. Must run before BOTH the art-mode switch
+                    # and the screen-off branch below.
+                    sensors_cfg = tv_config.get("motion_sensors", [])
+                    active = [
+                        sid for sid in sensors_cfg
+                        if (st := hass.states.get(sid)) is not None and st.state == "on"
+                    ]
+                    if active:
+                        _LOGGER.info(
+                            "Auto motion: Skipping turn-off for %s - motion still active on %s; rescheduling",
+                            tv_name, ", ".join(active),
+                        )
+                        start_motion_off_timer(tv_id)
+                        return
+
+                    # Check if TV is in art mode or playing content
+                    # If playing content, transition to art mode first and restart
+                    # the timer so it turns off after another delay with no motion.
+                    # This gives a graceful wind-down: content → art → off.
+                    art_mode = await hass.async_add_executor_job(is_art_mode_enabled, ip)
+
+                    if art_mode is False:
+                        motion_cache = hass.data[DOMAIN][entry.entry_id].get("motion_cache", {})
+                        last_motion_str = motion_cache.get(tv_id)
+                        off_delay_minutes = tv_config.get("motion_off_delay", 15)
+                        if last_motion_str:
+                            try:
+                                last_motion = datetime.fromisoformat(last_motion_str)
+                                seconds_since = (datetime.now(timezone.utc) - last_motion).total_seconds()
+                                if seconds_since < off_delay_minutes * 60:
+                                    _LOGGER.info(
+                                        "Auto motion: Skipping art-mode switch for %s - only %ds since last motion (need %dm); rescheduling",
+                                        tv_name, int(seconds_since), off_delay_minutes,
+                                    )
+                                    start_motion_off_timer(tv_id)
+                                    return
+                            except (ValueError, TypeError):
+                                pass
+
+                        # TV is playing content — switch to art mode instead of turning off
+                        _LOGGER.info(f"Auto motion: Switching {tv_name} to art mode (was playing content, no motion)")
+                        await hass.async_add_executor_job(set_art_mode, ip)
+
+                        log_activity(
+                            hass, entry.entry_id, tv_id,
+                            "motion_off",
+                            "Switched to art mode (no motion)",
+                        )
+
+                        # Clear timer state before restarting
+                        if tv_id in motion_off_times:
+                            del motion_off_times[tv_id]
+                        async_dispatcher_send(hass, f"{DOMAIN}_motion_off_time_updated_{entry.entry_id}_{tv_id}")
+
+                        # Restart the timer so the TV will turn off if still no motion
+                        start_motion_off_timer(tv_id)
+                        return
+
+                    # Already in art mode (or unknown) — turn off the screen
                     _LOGGER.info(f"Auto motion: Turning off {tv_name} ({ip}) due to no motion")
                     await hass.async_add_executor_job(frame_tv.tv_off, ip)
                     _LOGGER.info(f"Auto motion: {tv_name} turned off successfully")
-                    
+
                     # Build message with last sensor info if available
                     motion_cache = hass.data[DOMAIN][entry.entry_id].get("motion_cache", {})
                     last_sensor = motion_cache.get(f"{tv_id}_last_sensor")
@@ -1889,7 +2209,7 @@ if _HA_AVAILABLE:
                             motion_off_msg = f"Turned off - last: {sensor_short} {minutes_ago}m ago"
                         except (ValueError, TypeError):
                             pass
-                    
+
                     log_activity(
                         hass, entry.entry_id, tv_id,
                         "motion_off",
@@ -1994,6 +2314,22 @@ if _HA_AVAILABLE:
                         "motion_wake",
                         f"Screen on (woken by {sensor_short})",
                     )
+
+                    # WOL alone just powers the screen back on in whatever input/app
+                    # the TV was last showing (e.g. Android TV source). A motion wake
+                    # should always land in art mode, so force it here if needed.
+                    try:
+                        art_mode = await hass.async_add_executor_job(is_art_mode_enabled, ip)
+                        if art_mode is False:
+                            _LOGGER.info(f"Auto motion: {tv_name} woke into content, switching to art mode")
+                            await hass.async_add_executor_job(set_art_mode, ip)
+                            log_activity(
+                                hass, entry.entry_id, tv_id,
+                                "motion_wake",
+                                "Forced to art mode after wake",
+                            )
+                    except Exception as art_err:
+                        _LOGGER.warning(f"Auto motion: Could not ensure art mode for {tv_name}: {art_err}")
                 except Exception as err:
                     _LOGGER.warning(f"Auto motion: Failed to wake {tv_name}: {err}")
                     log_activity(
@@ -2100,6 +2436,19 @@ if _HA_AVAILABLE:
             if tv_config.get("enable_motion_control", False):
                 start_motion_listener(tv_id)
 
+        # Bootstrap content_id_map: merge JSON file → entry.data on first run,
+        # and refresh entry.data from any JSON edits made while HA was stopped.
+        try:
+            json_map = await hass.async_add_executor_job(_load_content_id_json)
+            bootstrap_content_id_map(hass, entry, json_map)
+            _LOGGER.info(
+                "Bootstrapped content_id_map from JSON: %d TV(s), %d total mappings",
+                len(json_map),
+                sum(len(v) for v in json_map.values()),
+            )
+        except Exception as _boot_err:
+            _LOGGER.warning("Could not bootstrap content_id_map: %s", _boot_err)
+
         # Generate and register the Lovelace dashboard
         await _async_setup_dashboard(hass, entry)
 
@@ -2113,6 +2462,390 @@ if _HA_AVAILABLE:
 
         # Register pool health API endpoint
         hass.http.register_view(PoolHealthView(hass, entry))
+
+        # Initialise Qdrant store for semantic search (non-fatal if unavailable)
+        try:
+            from .qdrant_store import get_store
+            qdrant_store = await hass.async_add_executor_job(get_store)
+            hass.data[DOMAIN][entry.entry_id]["qdrant_store"] = qdrant_store
+            _LOGGER.info("Qdrant store initialised for Frame Art Shuffler (semantic search enabled)")
+        except ModuleNotFoundError as _qdrant_err:
+            _LOGGER.warning(
+                "Qdrant store not available — semantic search disabled. "
+                "Python package missing: %s. Ensure manifest.json declares "
+                "'qdrant-client' in requirements and restart HA.",
+                _qdrant_err,
+            )
+        except Exception as _qdrant_err:  # noqa: BLE001
+            _LOGGER.warning(
+                "Qdrant store not available — semantic search disabled. "
+                "Verify QDRANT_URL / QDRANT_API_KEY / JINA_API_KEY in secrets.yaml "
+                "and network reachability. Error: %s",
+                _qdrant_err,
+            )
+
+        # Register search API endpoints and search UI
+        from .views import (
+            ArtDiscoverView,
+            ArtDisplayView,
+            ArtSearchConfigView,
+            ArtSearchUIView,
+            ArtSearchView,
+        )
+        hass.http.register_view(ArtSearchView(hass, entry))
+        hass.http.register_view(ArtSearchConfigView(hass, entry))
+        hass.http.register_view(ArtDisplayView(hass, entry))
+        hass.http.register_view(ArtDiscoverView(hass, entry))
+        hass.http.register_view(ArtSearchUIView())
+
+        # ------------------------------------------------------------------ #
+        # Qdrant ingestion: ingest_image service + hourly reconciler          #
+        # ------------------------------------------------------------------ #
+        async def _async_reconcile_qdrant(remove_orphans: bool = True) -> dict[str, int]:
+            data_local = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+            store = data_local.get("qdrant_store")
+            if store is None:
+                return {"added": 0, "removed": 0, "skipped": 0}
+
+            metadata_path: Path = data_local["metadata_path"]
+            library_dir = metadata_path.parent / "library"
+            if not library_dir.is_dir():
+                return {"added": 0, "removed": 0, "skipped": 0}
+
+            def _work() -> dict[str, int]:
+                meta_store = MetadataStore(metadata_path)
+                on_disk = {p.name for p in library_dir.iterdir() if p.is_file()}
+                in_qdrant = {
+                    pt["filename"] for pt in store.list_all() if pt.get("filename")
+                }
+
+                added = skipped = removed = 0
+                for fname in sorted(on_disk - in_qdrant):
+                    try:
+                        image_meta = meta_store.get_image(fname) or {}
+                        store.upsert_image(
+                            fname,
+                            tags=list(image_meta.get("tags", [])),
+                            matte=image_meta.get("matte"),
+                            filter_type=image_meta.get("filter"),
+                            width=image_meta.get("width"),
+                            height=image_meta.get("height"),
+                            tv_content_ids=image_meta.get("tvContentIds", {}),
+                            image_path=library_dir / fname,
+                        )
+                        added += 1
+                        time.sleep(1.5)  # Jina rate-limit courtesy (matches seed_qdrant)
+                    except Exception as e:  # noqa: BLE001
+                        _LOGGER.warning("reconcile_qdrant: %s failed: %s", fname, e)
+                        skipped += 1
+
+                if remove_orphans:
+                    for fname in in_qdrant - on_disk:
+                        try:
+                            store.remove_image(fname)
+                            removed += 1
+                        except Exception as e:  # noqa: BLE001
+                            _LOGGER.warning(
+                                "reconcile_qdrant: remove %s failed: %s", fname, e
+                            )
+
+                return {"added": added, "removed": removed, "skipped": skipped}
+
+            result = await hass.async_add_executor_job(_work)
+            if result["added"] or result["removed"] or result["skipped"]:
+                _LOGGER.info("reconcile_qdrant: %s", result)
+            return result
+
+        async def async_handle_ingest_image(call: ServiceCall) -> None:
+            filename: str = call.data.get("filename", "")
+            force: bool = bool(call.data.get("force", False))
+            if not filename:
+                raise ValueError("ingest_image: 'filename' is required")
+
+            data_local = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+            store = data_local.get("qdrant_store")
+            if store is None:
+                raise ServiceValidationError(
+                    "Qdrant store not initialised — check secrets.yaml"
+                )
+
+            metadata_path: Path = data_local["metadata_path"]
+            image_path = metadata_path.parent / "library" / filename
+            if not image_path.exists():
+                raise ServiceValidationError(
+                    f"ingest_image: {image_path} does not exist"
+                )
+
+            if not force:
+                existing = await hass.async_add_executor_job(
+                    store.find_by_filename, filename
+                )
+                if existing is not None:
+                    _LOGGER.debug(
+                        "ingest_image: %s already in Qdrant, skipping", filename
+                    )
+                    return
+
+            meta_store = MetadataStore(metadata_path)
+            image_meta = (
+                await hass.async_add_executor_job(meta_store.get_image, filename)
+            ) or {}
+            await hass.async_add_executor_job(
+                functools.partial(
+                    store.upsert_image,
+                    filename,
+                    tags=list(image_meta.get("tags", [])),
+                    matte=image_meta.get("matte"),
+                    filter_type=image_meta.get("filter"),
+                    width=image_meta.get("width"),
+                    height=image_meta.get("height"),
+                    tv_content_ids=image_meta.get("tvContentIds", {}),
+                    image_path=image_path,
+                )
+            )
+            _LOGGER.info("ingest_image: embedded %s into Qdrant", filename)
+
+        async def async_handle_reconcile_qdrant(call: ServiceCall) -> None:
+            await _async_reconcile_qdrant(
+                bool(call.data.get("remove_orphans", True))
+            )
+
+        hass.services.async_register(
+            DOMAIN, "ingest_image", async_handle_ingest_image
+        )
+        hass.services.async_register(
+            DOMAIN, "reconcile_qdrant", async_handle_reconcile_qdrant
+        )
+
+        # ------------------------------------------------------------------ #
+        # Auto-push-on-ingest toggle                                          #
+        # ------------------------------------------------------------------ #
+        async def async_handle_set_auto_push(call: ServiceCall) -> None:
+            """Toggle auto_push_on_ingest for one or all TVs.
+
+            Service data:
+              tv_id (optional str): which TV. If omitted, applies to all TVs.
+              enabled (bool): on/off.
+            """
+            from .config_entry import update_tv_config as _update_tv_config
+
+            enabled = bool(call.data.get("enabled", False))
+            tv_id_arg = call.data.get("tv_id")
+
+            tv_configs = list_tv_configs(entry)
+            if tv_id_arg:
+                if tv_id_arg not in tv_configs:
+                    raise ServiceValidationError(
+                        f"Unknown tv_id: {tv_id_arg!r}. "
+                        f"Known: {sorted(tv_configs.keys())}"
+                    )
+                target_ids = [tv_id_arg]
+            else:
+                target_ids = list(tv_configs.keys())
+
+            for tv_id in target_ids:
+                _update_tv_config(hass, entry, tv_id, {"auto_push_on_ingest": enabled})
+                _LOGGER.info(
+                    "auto_push_on_ingest=%s for TV %s (%s)",
+                    enabled, tv_configs[tv_id].get("name", tv_id), tv_id,
+                )
+
+        hass.services.async_register(
+            DOMAIN, "set_auto_push_on_ingest", async_handle_set_auto_push
+        )
+
+        # Hourly background reconciliation. No-op when the set difference is empty.
+        async def _periodic_reconcile(_now) -> None:
+            try:
+                await _async_reconcile_qdrant(remove_orphans=True)
+            except Exception as e:  # noqa: BLE001
+                _LOGGER.debug("Periodic reconcile_qdrant failed: %s", e)
+
+        entry.async_on_unload(
+            async_track_time_interval(
+                hass, _periodic_reconcile, timedelta(hours=1)
+            )
+        )
+
+        # ------------------------------------------------------------------ #
+        # Event-driven ingestion: inotify watcher on the library dir         #
+        # ------------------------------------------------------------------ #
+        # Fires within ~1s of the Frame Art Manager add-on writing a file.   #
+        # The hourly reconciler above stays in place as a backstop for       #
+        # missed events (HA was down, git pull, etc.).                       #
+        try:
+            from watchdog.observers import Observer as _WatchObserver
+            from watchdog.events import FileSystemEventHandler as _WatchHandler
+
+            _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif", ".heic", ".heif"}
+            _library_dir: Path = (
+                hass.data[DOMAIN][entry.entry_id]["metadata_path"].parent / "library"
+            )
+            _library_dir.mkdir(parents=True, exist_ok=True)
+
+            async def _async_ingest_one(filename: str) -> None:
+                # Let the add-on finish its rename/thumb/metadata writes before embedding.
+                await asyncio.sleep(1.5)
+                data_local = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+                store = data_local.get("qdrant_store")
+                if store is None:
+                    return
+                image_path = _library_dir / filename
+                if not image_path.exists():
+                    return
+                try:
+                    existing = await hass.async_add_executor_job(
+                        store.find_by_filename, filename
+                    )
+                    if existing is not None:
+                        return  # Already embedded — idempotent
+                    meta_store = MetadataStore(data_local["metadata_path"])
+                    image_meta = (
+                        await hass.async_add_executor_job(meta_store.get_image, filename)
+                    ) or {}
+                    await hass.async_add_executor_job(
+                        functools.partial(
+                            store.upsert_image,
+                            filename,
+                            tags=list(image_meta.get("tags", [])),
+                            matte=image_meta.get("matte"),
+                            filter_type=image_meta.get("filter"),
+                            width=image_meta.get("width"),
+                            height=image_meta.get("height"),
+                            tv_content_ids=image_meta.get("tvContentIds", {}),
+                            image_path=image_path,
+                        )
+                    )
+                    _LOGGER.info("watcher: ingested %s into Qdrant", filename)
+                except Exception as e:  # noqa: BLE001
+                    _LOGGER.warning("watcher: ingest %s failed: %s", filename, e)
+                    return
+
+                # Auto-push fan-out: any TV with auto_push_on_ingest=True
+                # gets a display_image call right after Qdrant indexing.
+                # display_image is idempotent for already-uploaded images
+                # (uses select_image fast-path) so no waste on re-runs.
+                tv_configs = list_tv_configs(entry)
+                push_targets = [
+                    (tv_id, cfg) for tv_id, cfg in tv_configs.items()
+                    if cfg.get("auto_push_on_ingest")
+                ]
+                if not push_targets:
+                    return
+                from homeassistant.helpers import entity_registry as er
+                ent_reg = er.async_get(hass)
+                for tv_id, cfg in push_targets:
+                    entity_id = ent_reg.async_get_entity_id(
+                        "sensor", DOMAIN,
+                        f"{entry.entry_id}_{tv_id}_tv_actual_image",
+                    )
+                    if not entity_id:
+                        _LOGGER.debug(
+                            "auto_push: could not resolve entity for TV %s",
+                            tv_id,
+                        )
+                        continue
+                    try:
+                        await hass.services.async_call(
+                            DOMAIN,
+                            "display_image",
+                            {"entity_id": entity_id, "filename": filename},
+                            blocking=False,  # don't block ingestion on TV upload
+                        )
+                        _LOGGER.info(
+                            "auto_push: queued %s → %s (%s)",
+                            filename, cfg.get("name", tv_id), tv_id,
+                        )
+                    except Exception as push_err:  # noqa: BLE001
+                        _LOGGER.warning(
+                            "auto_push: failed for %s → %s: %s",
+                            filename, tv_id, push_err,
+                        )
+
+            async def _async_remove_one(filename: str) -> None:
+                """Cascade delete: fan out to the remove_image service.
+
+                The service handles content_id_map.json, entry.data, and Qdrant.
+                delete_from_tv is False (conservative): TV gallery is left
+                alone so an accidental library delete or git pull can't nuke
+                the TV copy. Use the cleanup_tv_orphans skill to clean up
+                deliberately.
+                """
+                try:
+                    await hass.services.async_call(
+                        DOMAIN,
+                        "remove_image",
+                        {"filename": filename, "delete_from_tv": False},
+                        blocking=True,
+                    )
+                    _LOGGER.info(
+                        "watcher: cascaded remove for %s (TV copy kept)", filename
+                    )
+                except Exception as e:  # noqa: BLE001
+                    _LOGGER.debug("watcher: cascade remove %s failed: %s", filename, e)
+
+            def _bridge_ingest(filename: str) -> None:
+                hass.async_create_task(_async_ingest_one(filename))
+
+            def _bridge_remove(filename: str) -> None:
+                hass.async_create_task(_async_remove_one(filename))
+
+            class _LibraryHandler(_WatchHandler):
+                """Runs on watchdog's thread; bridges events to the event loop."""
+
+                @staticmethod
+                def _eligible(path_str: str) -> str | None:
+                    p = Path(path_str)
+                    if p.parent != _library_dir:
+                        return None
+                    if p.suffix.lower() not in _IMAGE_EXTS:
+                        return None
+                    return p.name
+
+                def on_created(self, event) -> None:  # type: ignore[override]
+                    if event.is_directory:
+                        return
+                    name = self._eligible(event.src_path)
+                    if name:
+                        hass.loop.call_soon_threadsafe(_bridge_ingest, name)
+
+                def on_moved(self, event) -> None:  # type: ignore[override]
+                    if event.is_directory:
+                        return
+                    name = self._eligible(event.dest_path)
+                    if name:
+                        hass.loop.call_soon_threadsafe(_bridge_ingest, name)
+
+                def on_deleted(self, event) -> None:  # type: ignore[override]
+                    if event.is_directory:
+                        return
+                    name = self._eligible(event.src_path)
+                    if name:
+                        hass.loop.call_soon_threadsafe(_bridge_remove, name)
+
+            _observer = _WatchObserver()
+            _observer.schedule(_LibraryHandler(), str(_library_dir), recursive=False)
+            _observer.daemon = True
+            await hass.async_add_executor_job(_observer.start)
+            _LOGGER.info("watcher: watching %s for ingestion events", _library_dir)
+
+            def _stop_observer() -> None:
+                _observer.stop()
+                _observer.join(timeout=5)
+
+            entry.async_on_unload(_stop_observer)
+        except ModuleNotFoundError as _watch_err:
+            _LOGGER.warning(
+                "watchdog not installed — event-driven ingestion disabled, "
+                "falling back to hourly reconciler. Error: %s",
+                _watch_err,
+            )
+        except Exception as _watch_err:  # noqa: BLE001
+            _LOGGER.warning(
+                "Library watcher failed to start — hourly reconciler will "
+                "still catch new files. Error: %s",
+                _watch_err,
+            )
 
         return True
 

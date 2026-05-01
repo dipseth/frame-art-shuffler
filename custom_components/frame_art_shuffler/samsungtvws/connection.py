@@ -8,6 +8,7 @@ SPDX-License-Identifier: LGPL-3.0
 
 import json
 import logging
+import os
 import ssl
 import threading
 import time
@@ -90,9 +91,22 @@ class SamsungTVWSBaseConnection:
     def _get_token(self) -> Optional[str]:
         if self.token_file is not None:
             try:
-                with open(self.token_file) as token_file:
-                    return token_file.readline()
+                size = os.path.getsize(self.token_file)
             except OSError:
+                size = -1
+            try:
+                with open(self.token_file) as token_file:
+                    contents = token_file.readline()
+                _LOGGING.info(
+                    "token read: path=%s size=%d len=%d tid=%d",
+                    self.token_file, size, len(contents), threading.get_ident(),
+                )
+                return contents
+            except OSError as err:
+                _LOGGING.info(
+                    "token read miss: path=%s size=%d err=%s tid=%d",
+                    self.token_file, size, err, threading.get_ident(),
+                )
                 return None
         else:
             return self.token
@@ -100,7 +114,14 @@ class SamsungTVWSBaseConnection:
     def _set_token(self, token: str) -> None:
         _LOGGING.info("New token %s", token)
         if self.token_file is not None:
-            _LOGGING.debug("Save token to file: %s", token)
+            try:
+                old_size = os.path.getsize(self.token_file)
+            except OSError:
+                old_size = -1
+            _LOGGING.info(
+                "token write: path=%s old_size=%d new_len=%d tid=%d",
+                self.token_file, old_size, len(token), threading.get_ident(),
+            )
             with open(self.token_file, "w") as token_file:
                 token_file.write(token)
         else:

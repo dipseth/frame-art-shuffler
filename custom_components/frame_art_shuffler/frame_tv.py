@@ -13,6 +13,7 @@ integration to turn the screen off while maintaining art mode.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import re
@@ -42,11 +43,12 @@ from .const import DEFAULT_PORT, DEFAULT_TIMEOUT
 
 _LOGGER = logging.getLogger(__name__)
 
-TOKEN_DIR = Path(__file__).resolve().parent / "tokens"
+# Use the persistent data directory for tokens to survive restarts
+TOKEN_DIR = Path("/config/frame_art_shuffler/tokens")
 
 _ART_MODE_ON = "on"
-_UPLOAD_RETRIES = 3
-_UPLOAD_RETRY_DELAY = 2
+_UPLOAD_RETRIES = 4  # Increased retries for 2023 Frame TVs
+_UPLOAD_RETRY_DELAY = 3  # Increased delay between retries
 _INITIAL_UPLOAD_SETTLE = 6
 
 # Placeholder matte used during upload to enable matte support.
@@ -62,6 +64,15 @@ _VALID_BRIGHTNESS = set(range(1, 11)) | {50}
 _WARN_FILE_MB = 10
 _LARGE_FILE_MB = 15
 _MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+
+# Pre-upload normalisation: keep payloads inside the working envelope of
+# older Frame firmware (≤0.97-era). Oversized files trigger either the TV's
+# generic "error -1" on send_image, or the Python SSL layer's BAD_LENGTH on
+# the outbound websocket frame. Native panel is 3840x2160; resizing to fit
+# loses nothing visually because the TV downscales on display anyway.
+_UPLOAD_MAX_EDGE = 3840
+_UPLOAD_TARGET_BYTES = 4 * 1024 * 1024
+_UPLOAD_QUALITY_LADDER = (88, 82, 76, 70, 64)
 _POWER_COMMAND_RETRIES = 4
 _POWER_RETRY_DELAY = 2
 _POWER_COMMAND_TIMEOUT = 8
@@ -70,10 +81,19 @@ _WOL_BROADCAST_IP = "255.255.255.255"
 _WOL_BROADCAST_PORT = 9
 _WOL_WAKE_DELAY = 2
 
+# Per-IP cache: TVs that have returned error -9 for set_photo_filter.
+# Populated on first failure so we skip the call on subsequent shuffles
+# rather than generating a warning every cycle.
+_filters_unsupported: set[str] = set()
+
 # Use a dedicated directory for integration data to keep /config clean
 # This matches the structure we want for tokens as well
 DATA_DIR = Path("/config/frame_art_shuffler")
 PROGRESS_LOG_FILE = DATA_DIR / "upload.log"
+
+# Shared metadata.json written by both the shuffler and the Frame Art Manager.
+# Used as a fallback lookup when content_id_map.json doesn't have a mapping.
+_METADATA_FILE = Path("/config/www/frame_art/metadata.json")
 
 
 def _log_progress(msg: str) -> None:
@@ -117,6 +137,352 @@ class FrameArtUploadError(FrameArtError):
     """Raised when an upload or art operation fails."""
 
 
+def _tv_error_code(msg: str) -> Optional[int]:
+    # Samsung errors render as "... with error number -11". Substring matching
+    # on "-1" silently matches "-11"/"-12"/etc. — parse the int and compare.
+    m = re.search(r"error number (-?\d+)", msg)
+    return int(m.group(1)) if m else None
+
+
+def _prepare_payload_for_upload(
+    payload: bytes, file_type: str
+) -> tuple[bytes, str, dict]:
+    """Normalise oversized images so older Frame firmware accepts them.
+
+    Returns (new_payload, new_file_type, info). A no-op for images already
+    within the working envelope. For JPEGs beyond it, resizes to fit inside
+    3840x2160 and iteratively lowers JPEG quality until the payload is under
+    ~4 MB. Non-JPEG sources that are oversized are decoded and re-encoded as
+    JPEG (the TV accepts JPEG over PNG anyway for photographic content).
+    """
+    orig_len = len(payload)
+    info: dict = {"orig_bytes": orig_len, "resized": False, "recompressed": False}
+
+    try:
+        from PIL import Image
+        import io
+    except Exception:
+        # PIL isn't available — ship the original and let the TV try
+        return payload, file_type, info
+
+    needs_size_fix = orig_len > _UPLOAD_TARGET_BYTES
+    needs_dim_check = True  # always open to inspect dimensions
+
+    if not needs_size_fix and file_type.lower() == "jpeg":
+        # Peek at dimensions cheaply. If within bounds, skip re-encode entirely.
+        try:
+            img = Image.open(io.BytesIO(payload))
+            img.verify()
+            img = Image.open(io.BytesIO(payload))  # re-open; verify() invalidates
+            if max(img.size) <= _UPLOAD_MAX_EDGE:
+                info["orig_dims"] = img.size
+                return payload, file_type, info
+        except Exception:
+            pass  # fall through to the full re-encode path
+        needs_dim_check = True
+
+    try:
+        img = Image.open(io.BytesIO(payload))
+        img.load()
+    except Exception as e:  # noqa: BLE001
+        _LOGGER.warning("prepare_payload: cannot decode image (%s), shipping as-is", e)
+        return payload, file_type, info
+
+    info["orig_dims"] = img.size
+
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+
+    if max(img.size) > _UPLOAD_MAX_EDGE:
+        ratio = _UPLOAD_MAX_EDGE / max(img.size)
+        new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
+        img = img.resize(new_size, Image.LANCZOS)
+        info["resized"] = True
+        info["new_dims"] = new_size
+
+    # Iteratively encode JPEG until under the target size.
+    out_bytes = payload
+    for q in _UPLOAD_QUALITY_LADDER:
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=q, optimize=True, progressive=False)
+        out_bytes = buf.getvalue()
+        if len(out_bytes) <= _UPLOAD_TARGET_BYTES:
+            info["quality"] = q
+            break
+
+    info["new_bytes"] = len(out_bytes)
+    info["recompressed"] = True
+    return out_bytes, "JPEG", info
+
+
+def get_current_artwork(ip: str) -> dict | None:
+    """Return the TV's actual currently-displayed artwork, or None on failure.
+
+    Queries the TV via WebSocket and resolves the content_id to a local
+    filename using the content_id_map.  Safe to call from an executor thread.
+
+    Returns a dict with keys:
+        content_id  – Samsung content ID (e.g. "MY_F0051")
+        matte_id    – current matte (e.g. "shadowbox_sage") or None
+        filename    – local filename if mapped, else None
+    """
+    try:
+        with _FrameTVSession(ip, timeout=10) as session:
+            data = session.art.get_current()
+        if not data:
+            return None
+        content_id = data.get("content_id")
+        matte_id = data.get("matte_id")
+        # Resolve content_id → filename via the cached map
+        filename: str | None = None
+        mapping = _load_content_map()
+        tv_map = mapping.get(ip, {})
+        for fname, cid in tv_map.items():
+            if cid == content_id:
+                filename = fname
+                break
+
+        # Fallback: scan metadata.json tvContentIds written by display_art()
+        # This covers images uploaded via the Frame Art Manager UI that were
+        # never tracked by the shuffler's content_id_map.json.
+        if filename is None and content_id:
+            try:
+                if _METADATA_FILE.exists():
+                    with open(_METADATA_FILE, "r", encoding="utf-8") as _f:
+                        _meta = json.load(_f)
+                    for _fname, _info in _meta.get("images", {}).items():
+                        if _info.get("tvContentIds", {}).get(ip) == content_id:
+                            filename = _fname
+                            # Backfill content_id_map so future lookups are fast
+                            mapping.setdefault(ip, {})[_fname] = content_id
+                            _save_content_map(mapping)
+                            _LOGGER.debug(
+                                "get_current_artwork: resolved %s→%s via metadata.json (backfilled map)",
+                                content_id, filename,
+                            )
+                            break
+            except Exception as _meta_err:
+                _LOGGER.debug("get_current_artwork: metadata.json fallback failed: %s", _meta_err)
+
+        return {"content_id": content_id, "matte_id": matte_id, "filename": filename}
+    except Exception as err:  # pylint: disable=broad-except
+        _LOGGER.debug("get_current_artwork(%s) failed: %s", ip, err)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Content-ID mapping: tracks which local filenames are already on which TV
+# so we can use fast select_image instead of re-uploading every time.
+# ---------------------------------------------------------------------------
+_CONTENT_MAP_FILE = DATA_DIR / "content_id_map.json"
+
+
+def _load_content_map() -> dict:
+    """Load the {tv_ip: {filename: content_id}} mapping from disk."""
+    try:
+        if _CONTENT_MAP_FILE.exists():
+            with open(_CONTENT_MAP_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        _LOGGER.warning("Could not load content_id map, starting fresh")
+    return {}
+
+
+def _save_content_map(mapping: dict) -> None:
+    """Persist the content_id mapping to disk with an exclusive file lock.
+
+    Uses fcntl.flock to prevent concurrent writes from the shuffler,
+    the Frame Art Manager, or ad-hoc scripts from stomping each other.
+    """
+    try:
+        _CONTENT_MAP_FILE.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = _CONTENT_MAP_FILE.with_suffix(".lock")
+        with open(lock_path, "w") as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            try:
+                with open(_CONTENT_MAP_FILE, "w", encoding="utf-8") as f:
+                    json.dump(mapping, f, indent=2)
+            finally:
+                fcntl.flock(lf, fcntl.LOCK_UN)
+    except Exception:
+        _LOGGER.warning("Could not save content_id map")
+
+
+def _get_tv_content_ids(ip: str) -> dict[str, dict]:
+    """Query the TV for all images currently stored, returned as {content_id: info}."""
+    try:
+        with _FrameTVSession(ip, timeout=10) as session:
+            available = session.art.available() or []
+            seen: dict[str, dict] = {}
+            for img in available:
+                cid = img.get("content_id")
+                if cid and cid not in seen:
+                    seen[cid] = img
+            return seen
+    except Exception as err:
+        _LOGGER.warning("Could not query TV gallery on %s: %s", ip, err)
+        return {}
+
+
+def sync_content_map(ip: str) -> dict[str, str]:
+    """Validate the content_id map against what's actually on the TV.
+
+    Removes stale entries (images no longer on TV) and returns the
+    cleaned map for this TV: {filename: content_id}.
+    """
+    mapping = _load_content_map()
+    tv_map = mapping.get(ip, {})
+
+    if not tv_map:
+        return {}
+
+    on_tv = _get_tv_content_ids(ip)
+    valid_ids = set(on_tv.keys())
+
+    cleaned = {fn: cid for fn, cid in tv_map.items() if cid in valid_ids}
+
+    if len(cleaned) != len(tv_map):
+        removed = len(tv_map) - len(cleaned)
+        _LOGGER.info("Removed %d stale entries from content map for %s", removed, ip)
+        mapping[ip] = cleaned
+        _save_content_map(mapping)
+
+    return cleaned
+
+
+def display_art(
+    ip: str,
+    artpath: str,
+    *,
+    mac_address: Optional[str] = None,
+    matte: Optional[str] = None,
+    photo_filter: Optional[str] = None,
+    brightness: Optional[int] = None,
+    debug: bool = False,
+) -> str:
+    """Display an image on the TV, using select_image if already uploaded.
+
+    This is the preferred entry point for showing art. It:
+    1. Checks if the image is already on the TV (via content_id map)
+    2. If yes, uses fast select_image (no re-upload needed)
+    3. If no, uploads the image and records the mapping
+    4. Applies matte/filter if requested
+    5. Never deletes other images from the TV
+    """
+    _clear_progress()
+    file_path = Path(artpath).expanduser().resolve()
+    filename = file_path.name
+
+    if not file_path.exists():
+        raise FrameArtUploadError(f"Art file not found: {file_path}")
+
+    mapping = _load_content_map()
+    tv_map = mapping.setdefault(ip, {})
+    existing_cid = tv_map.get(filename)
+
+    # If we have a cached content_id, try to select it directly
+    if existing_cid:
+        _log_progress(f"Image {filename} already on TV as {existing_cid}, selecting...")
+        max_select_attempts = 3
+        for select_attempt in range(max_select_attempts):
+            try:
+                with _FrameTVSession(ip, timeout=15) as session:
+                    art = session.art
+
+                    # Wake the screen before attempting to select (especially for 2023 Frame TVs)
+                    if select_attempt > 0:
+                        _log_progress(f"Waking screen for select attempt {select_attempt + 1}/{max_select_attempts}...")
+                        try:
+                            art.set_artmode("on")
+                            time.sleep(5)  # Give screen time to wake up
+                        except Exception as wake_err:
+                            _LOGGER.warning("Failed to wake screen for select: %s", wake_err)
+
+                    # Verify the image is still on the TV
+                    available = art.available() or []
+                    on_tv_ids = {img.get("content_id") for img in available}
+
+                    if existing_cid in on_tv_ids:
+                        art.select_image(existing_cid, show=True)
+                        time.sleep(3)  # Increased time for selection to take effect
+
+                        if matte and matte != "none":
+                            try:
+                                art.change_matte(existing_cid, matte)
+                                _log_progress(f"Applied matte: {matte}")
+                            except Exception as matte_err:
+                                _LOGGER.warning("Failed to apply matte: %s", matte_err)
+
+                        if brightness is not None:
+                            _set_brightness(art, brightness, debug=debug)
+
+                        _log_progress(f"Displaying {filename} ({existing_cid}) via select_image")
+                        return existing_cid
+                    else:
+                        _log_progress(f"Cached {existing_cid} no longer on TV, will re-upload")
+                        del tv_map[filename]
+                        _save_content_map(mapping)
+                        break  # Exit the retry loop if image not found
+            except Exception as err:
+                error_msg = str(err)
+                _LOGGER.warning("select_image attempt %s failed for %s: %s", select_attempt + 1, existing_cid, error_msg)
+                
+                # Check if this is the screen sleep error
+                is_screen_off_error = _tv_error_code(error_msg) == -1
+
+                if is_screen_off_error and select_attempt < max_select_attempts - 1:
+                    _log_progress(f"Screen appears to be sleeping, will retry select...")
+                    time.sleep(3)  # Wait before retry
+                    continue
+                else:
+                    # Last attempt or different error, fall back to upload
+                    _log_progress(f"Select failed after {select_attempt + 1} attempts, falling back to upload")
+                    break
+
+    # Image not on TV (or select failed) — upload it
+    _log_progress(f"Uploading {filename} to {ip}...")
+    content_id = set_art_on_tv_deleteothers(
+        ip,
+        artpath,
+        mac_address=mac_address,
+        delete_others=False,
+        ensure_art_mode=True,
+        matte=matte,
+        photo_filter=photo_filter,
+        brightness=brightness,
+        debug=debug,
+    )
+
+    # Save the mapping
+    tv_map[filename] = content_id
+    _save_content_map(mapping)
+    _log_progress(f"Mapped {filename} -> {content_id}")
+
+    # Also write back to metadata.json so the Frame Art Manager can see the
+    # content_id and get_current_artwork() has a fallback if content_id_map
+    # is ever lost or stale.
+    try:
+        if _METADATA_FILE.exists():
+            from .metadata import MetadataStore
+            MetadataStore(_METADATA_FILE).update_image_content_id(filename, ip, content_id)
+    except ImportError:
+        # Running outside HA (e.g. test scripts) — try direct JSON write
+        try:
+            with open(_METADATA_FILE, "r", encoding="utf-8") as _f:
+                _meta = json.load(_f)
+            _img_entry = _meta.get("images", {}).get(filename)
+            if _img_entry is not None:
+                _img_entry.setdefault("tvContentIds", {})[ip] = content_id
+                with open(_METADATA_FILE, "w", encoding="utf-8") as _f:
+                    json.dump(_meta, _f, indent=2)
+        except Exception as _meta_err:
+            _LOGGER.debug("display_art: could not write contentId to metadata.json: %s", _meta_err)
+    except Exception as _meta_err:
+        _LOGGER.debug("display_art: could not write contentId to metadata.json: %s", _meta_err)
+
+    return content_id
+
+
 def set_token_directory(path: Path) -> None:
     """Override the token storage directory used by SamsungTVWS."""
 
@@ -132,6 +498,7 @@ class _FrameTVSession:
     def __init__(self, ip: str, timeout: Optional[float] = None) -> None:
         self.ip = ip
         self.token_path = _token_path(ip)
+        self._timeout = timeout
         _LOGGER.debug("Using token path: %s (exists: %s)", self.token_path, self.token_path.exists())
         self._remote = _build_client(ip, self.token_path, timeout=timeout)
 
@@ -147,7 +514,12 @@ class _FrameTVSession:
                 _LOGGER.warning("Handshake attempt failed: %s", err)
                 # We continue anyway, as art() might handle it or we want to bubble the error later
 
-        self._art = cast(Any, self._remote.art())
+        # Pass the session timeout to the art channel so upload operations
+        # don't time out prematurely. remote.art() defaults to only 5s which
+        # is far too short for image uploads that need to wait for
+        # "ready_to_use" and "image_added" events from the TV.
+        art_timeout = timeout if timeout is not None else DEFAULT_TIMEOUT
+        self._art = cast(Any, self._remote.art(timeout=art_timeout))
 
     @property
     def art(self) -> Any:
@@ -193,12 +565,29 @@ def set_art_on_tv_deleteothers(
     _log_file_details(file_path, payload)
 
     file_type = _detect_file_type(file_path)
+
+    # Normalise oversized payloads so old Frame firmware accepts them.
+    payload, file_type, prep_info = _prepare_payload_for_upload(payload, file_type)
+    if prep_info.get("resized") or prep_info.get("recompressed"):
+        orig_mb = prep_info["orig_bytes"] / (1024 * 1024)
+        new_mb = len(payload) / (1024 * 1024)
+        dims = (
+            f"{prep_info['orig_dims']}→{prep_info.get('new_dims', prep_info['orig_dims'])}"
+            if "orig_dims" in prep_info else "?"
+        )
+        q = prep_info.get("quality", "?")
+        _log_progress(
+            f"Prepared payload: {orig_mb:.1f}MB → {new_mb:.1f}MB "
+            f"(dims {dims}, JPEG q={q})"
+        )
+
     file_size = len(payload)
 
     if file_size > _MAX_UPLOAD_BYTES:
         size_mb = file_size / (1024 * 1024)
         raise FrameArtUploadError(
-            f"Art file {file_path.name} is {size_mb:.2f} MB; maximum supported size is 5.00 MB"
+            f"Art file {file_path.name} is {size_mb:.2f} MB after normalisation; "
+            f"max supported is {_MAX_UPLOAD_BYTES/1024/1024:.0f} MB"
         )
 
     # Fail fast: Check if TV is reachable with a short timeout before starting the heavy upload process
@@ -237,6 +626,7 @@ def set_art_on_tv_deleteothers(
     response = None
     last_error: Optional[Exception] = None
     content_id: Optional[str] = None
+    screen_wake_attempted = False
     
     for attempt in range(_UPLOAD_RETRIES):
         if attempt:
@@ -244,13 +634,25 @@ def set_art_on_tv_deleteothers(
             time.sleep(_UPLOAD_RETRY_DELAY)
         
         try:
-            # Use 120s timeout for upload to handle large files/slow networks
-            with _FrameTVSession(ip, timeout=120) as session:
+            # Use 150s timeout for upload to handle large files/slow networks and 2023 Frame TVs
+            with _FrameTVSession(ip, timeout=150) as session:
                 art = session.art
 
                 if ensure_art_mode and attempt == 0:  # Only check on first attempt
                     _ensure_art_mode(art, debug=debug)
 
+                # Samsung TVs reject send_image with error -1 when the screen is
+                # sleeping (art mode standby).  Explicitly set art mode to "on" to
+                # wake the screen before upload.  This is idempotent if already on.
+                if not screen_wake_attempted:
+                    try:
+                        _log_progress("Waking TV screen for upload...")
+                        art.set_artmode("on")
+                        time.sleep(5)  # Increased sleep time to give screen more time to wake up
+                        screen_wake_attempted = True
+                    except Exception as wake_err:  # pylint: disable=broad-except
+                        _LOGGER.warning("set_artmode('on') failed: %s", wake_err)
+                
                 if brightness is not None and attempt == 0:  # Only set on first attempt
                     _set_brightness(art, brightness, debug=debug)
 
@@ -273,6 +675,24 @@ def set_art_on_tv_deleteothers(
                     # If we can't list images, upload will likely fail too, but we'll try anyway
                     # as per original logic, but logged as warning now.
 
+                # Legacy 0.97 firmware has a much tighter practical upload
+                # ceiling (~4 MB) than newer TVs. Oversized payloads don't
+                # just fail — they can wedge the TV's upload state machine
+                # until a power cycle. Refuse fast instead of trying.
+                try:
+                    is_legacy = bool(art._is_legacy_api())
+                except Exception:  # noqa: BLE001
+                    is_legacy = False
+                if is_legacy and len(payload) > _UPLOAD_TARGET_BYTES:
+                    mb = len(payload) / (1024 * 1024)
+                    raise FrameArtUploadError(
+                        f"Payload {mb:.1f} MB exceeds the legacy (0.97 firmware) "
+                        f"safe limit of {_UPLOAD_TARGET_BYTES/1024/1024:.0f} MB. "
+                        "The resize helper should have handled this — either "
+                        "the source is unusually incompressible or Pillow is "
+                        "unavailable. Aborting before the TV gets a bad frame."
+                    )
+
                 # Upload with this fresh connection
                 kwargs = {"file_type": file_type}
                 if matte is not None:
@@ -282,34 +702,71 @@ def set_art_on_tv_deleteothers(
                 try:
                     _log_progress(f"Uploading image to {ip} (attempt {attempt + 1}/{_UPLOAD_RETRIES})...")
                     
-                    # Use our custom chunked upload instead of the library's default upload
-                    # to avoid hangs on large files/slow networks
-                    
                     # Matte workaround: Samsung firmware has a bug where uploading with a matte
                     # causes Error 40000 when selecting the image. Workaround is to upload with
                     # a placeholder matte, then use change_matte() to apply the desired matte.
                     # See docs/MATTE_BEHAVIOR.md for details.
+                    #
+                    # On legacy 0.97 firmware the placeholder ("flexible_warm")
+                    # itself triggers send_image error -1. The standalone
+                    # smoke test confirmed that matte="none" works while
+                    # matte="flexible_warm" does not. So on legacy, upload
+                    # un-matted and apply the desired matte purely via
+                    # change_matte() afterwards.
                     desired_matte = kwargs.get("matte")
-                    if desired_matte and desired_matte != "none":
-                        # Upload with placeholder, then change_matte after
-                        content_id = _upload_chunked(
-                            art, 
-                            payload, 
-                            file_type=file_type, 
-                            matte=_MATTE_PLACEHOLDER,
-                            portrait_matte=_MATTE_PLACEHOLDER
+                    if is_legacy:
+                        upload_matte = "none"
+                        upload_portrait_matte = "none"
+                    else:
+                        upload_matte = (
+                            _MATTE_PLACEHOLDER if (desired_matte and desired_matte != "none")
+                            else "none"
                         )
+                        upload_portrait_matte = upload_matte
+                    
+                    # Use the library's native upload() first (battle-tested protocol),
+                    # falling back to our custom _upload_chunked for large files or
+                    # if native upload fails with a non-error-code issue.
+                    try:
+                        _log_progress(f"Uploading via native art.upload() ({file_type}, {len(payload)} bytes)...")
+                        result = art.upload(
+                            payload,
+                            matte=upload_matte,
+                            portrait_matte=upload_portrait_matte,
+                            file_type=file_type,
+                        )
+                        content_id = _extract_content_id(result) if result else None
+                        if not content_id:
+                            raise FrameArtUploadError("Native upload returned no content_id")
+                    except Exception as native_err:
+                        native_msg = str(native_err)
+                        # The chunked fallback uses the D2D socket protocol
+                        # that only exists on post-0.97 firmware. Use the
+                        # is_legacy value we cached BEFORE upload (the post-
+                        # failure websocket state is unreliable for re-querying).
+                        if is_legacy:
+                            _LOGGER.info(
+                                "Native (WS-binary) upload failed on 0.97 TV (%s); "
+                                "skipping D2D chunked fallback (unsupported on legacy firmware)",
+                                native_msg,
+                            )
+                            _log_progress(
+                                "Native upload failed; skipping D2D fallback (legacy 0.97 TV)"
+                            )
+                            raise
+                        _LOGGER.info("Native upload failed (%s), trying chunked upload...", native_msg)
+                        _log_progress(f"Native upload failed, trying chunked upload...")
+                        content_id = _upload_chunked(
+                            art,
+                            payload,
+                            file_type=file_type,
+                            matte=upload_matte,
+                            portrait_matte=upload_portrait_matte,
+                        )
+                    
+                    if desired_matte and desired_matte != "none" and content_id:
                         _log_progress(f"Applying matte: {desired_matte}")
                         art.change_matte(content_id, desired_matte)
-                    else:
-                        # No matte requested - upload normally
-                        content_id = _upload_chunked(
-                            art, 
-                            payload, 
-                            file_type=file_type, 
-                            matte="none",
-                            portrait_matte="none"
-                        )
                     
                     _log_progress(f"Upload successful, content_id={content_id}")
                     if debug:
@@ -320,6 +777,50 @@ def set_art_on_tv_deleteothers(
                 except Exception as upload_err:  # pylint: disable=broad-except
                     error_msg = str(upload_err)
                     _LOGGER.warning("Upload attempt %s failed with error: %s", attempt + 1, error_msg)
+                    _log_progress(f"Upload attempt {attempt + 1} failed: {error_msg}")
+
+                    # On legacy 0.97 firmware, error -1 + screen-wake retries
+                    # is a known dead end (we've already done set_artmode("on")
+                    # at session open). Each retry just hammers the TV for
+                    # 37s of WOL + delays before failing identically. Bail
+                    # immediately so the UI gets a clear error instead of a
+                    # 2.5-minute hang. The TV needs a power cycle to recover.
+                    is_screen_off_error = _tv_error_code(error_msg) == -1
+                    if is_screen_off_error and is_legacy:
+                        _log_progress(
+                            "Legacy 0.97 TV returned -1 — aborting retries. "
+                            "Power-cycle the TV to clear the upload-state wedge."
+                        )
+                        last_error = upload_err
+                        break
+
+                    # Samsung error -1 means the TV screen is sleeping/off in art
+                    # mode standby. The TV responds to queries but rejects send_image.
+                    # Try WOL + set_artmode to wake the screen for the next retry.
+                    if is_screen_off_error and mac_address:
+                        _log_progress("TV screen appears to be sleeping. Attempting to wake screen...")
+                        try:
+                            # Send multiple WOL packets with longer delays for 2023 Frame TVs
+                            _send_wake_on_lan(mac_address)
+                            time.sleep(8)  # Increased delay
+                            _send_wake_on_lan(mac_address)
+                            time.sleep(8)  # Increased delay
+                            _send_wake_on_lan(mac_address)  # Third attempt
+                            time.sleep(8)
+                            
+                            # Try to wake via art API on a fresh session with longer timeout
+                            with _FrameTVSession(ip, timeout=45) as wake_session:
+                                wake_session.art.set_artmode("on")
+                                time.sleep(10)  # Extra time for screen to fully wake
+                                # Verify screen is awake by checking art mode status
+                                status = wake_session.art.get_artmode()
+                                if status != "on":
+                                    _log_progress("Art mode still not 'on' after wake attempt")
+                            _log_progress("Screen wake attempt complete. Retrying upload...")
+                            screen_wake_attempted = True  # Don't try wake again in the session setup
+                        except Exception as wake_err:  # pylint: disable=broad-except
+                            _LOGGER.warning("Screen wake attempt failed: %s", wake_err)
+                            _log_progress(f"Screen wake failed: {wake_err}")
                     
                     # Check if this is a timeout
                     is_timeout = "timeout" in error_msg.lower() or "timed out" in error_msg.lower()
@@ -421,16 +922,32 @@ def set_art_on_tv_deleteothers(
 
             # Apply photo filter if specified
             if photo_filter is not None and photo_filter.lower() not in ("none", ""):
-                try:
-                    _log_progress(f"Applying photo filter '{photo_filter}' to {ip}")
-                    if debug:
-                        _LOGGER.debug("Applying photo filter '%s' to content_id=%s", photo_filter, content_id)
-                    art.set_photo_filter(content_id, photo_filter)
-                    _log_progress(f"Photo filter '{photo_filter}' applied successfully")
-                    if debug:
-                        _LOGGER.debug("Successfully applied photo filter '%s'", photo_filter)
-                except Exception as filter_err:  # pylint: disable=broad-except
-                    _LOGGER.warning("Failed to apply photo filter '%s': %s", photo_filter, filter_err)
+                if ip in _filters_unsupported:
+                    _LOGGER.debug(
+                        "Skipping photo filter '%s' — TV %s does not support filters (v0.97 API)",
+                        photo_filter, ip,
+                    )
+                else:
+                    try:
+                        _log_progress(f"Applying photo filter '{photo_filter}' to {ip}")
+                        if debug:
+                            _LOGGER.debug("Applying photo filter '%s' to content_id=%s", photo_filter, content_id)
+                        art.set_photo_filter(content_id, photo_filter)
+                        _log_progress(f"Photo filter '{photo_filter}' applied successfully")
+                        if debug:
+                            _LOGGER.debug("Successfully applied photo filter '%s'", photo_filter)
+                    except Exception as filter_err:  # pylint: disable=broad-except
+                        err_str = str(filter_err)
+                        if _tv_error_code(err_str) == -9:
+                            _filters_unsupported.add(ip)
+                            _LOGGER.warning(
+                                "TV %s does not support photo filters (error -9, likely v0.97 API). "
+                                "Filters will be skipped for this TV going forward. "
+                                "Remove filter values from image metadata to suppress this message.",
+                                ip,
+                            )
+                        else:
+                            _LOGGER.warning("Failed to apply photo filter '%s': %s", photo_filter, filter_err)
 
             if delete_others:
                 _log_progress("Cleaning up old images from TV memory...")
@@ -549,20 +1066,23 @@ def tv_on(ip: str, mac_address: str) -> bool:
     
     Samsung Frame TVs require a two-stage Wake-on-LAN approach with significant delay:
     
-    1. First WOL wakes the network interface, but the TV enters a "network awake, 
+    1. First WOL wakes the network interface, but the TV enters a "network awake,
        screen off" standby state where the screen remains black.
     
     2. The TV needs 12+ seconds to fully transition into this network-awake state
        before it will respond to commands.
     
-    3. Second WOL (sent after the delay) actually turns on the screen and displays 
+    3. Second WOL (sent after the delay) actually turns on the screen and displays
        art mode.
     
     CRITICAL: The 12-second delay between WOL packets is required. Testing showed that
-    shorter delays (2s, 5s) do not work - the TV must fully enter the network-awake 
-    state before the second WOL will turn on the screen. This mimics the reliable 
-    behavior of manually running the WOL command twice from the CLI with natural 
+    shorter delays (2s, 5s) do not work - the TV must fully enter the network-awake
+    state before the second WOL will turn on the screen. This mimics the reliable
+    behavior of manually running the WOL command twice from the CLI with natural
     human delay between commands.
+    
+    For 2023 Frame TVs (LS03 series), an additional WOL packet may be needed
+    to ensure the screen fully wakes from deep sleep.
     
     This function intentionally does NOT send KEY_POWER to avoid toggle issues where
     the TV might switch from art mode to TV content mode unexpectedly.
@@ -582,14 +1102,21 @@ def tv_on(ip: str, mac_address: str) -> bool:
     # This delay was determined through testing - shorter delays (2s, 5s) do not work.
     # The TV needs this time to transition from "fully off" to "network awake, screen off"
     # before the second WOL packet will successfully turn on the screen.
-    time.sleep(12)
+    time.sleep(15)  # Increased delay for 2023 Frame TVs
     
     # Second WOL: Turn on screen
     _send_wake_on_lan(mac_address)
     _LOGGER.info("Wake-on-LAN packet sent to %s (second - turning on screen)", mac_address)
     
+    # Additional wait for 2023 Frame TVs
+    time.sleep(5)
+    
+    # Third WOL for 2023 Frame TVs that may be in deeper sleep
+    _send_wake_on_lan(mac_address)
+    _LOGGER.info("Wake-on-LAN packet sent to %s (third - ensuring screen wake)", mac_address)
+    
     # Give TV time to fully wake up and display art
-    time.sleep(3)
+    time.sleep(5)
     
     # Check state for diagnostic purposes (don't take action based on it)
     try:
@@ -824,7 +1351,7 @@ def _ensure_art_mode(art, *, debug: bool) -> None:
         return
 
     try:
-        art.set_artmode(True)
+        art.set_artmode("on")
         time.sleep(_INITIAL_UPLOAD_SETTLE)
         status = art.get_artmode()
     except Exception as err:  # pylint: disable=broad-except

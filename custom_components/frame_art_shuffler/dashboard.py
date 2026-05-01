@@ -126,6 +126,9 @@ def _build_dashboard(
             }],
         })
 
+    # Add Search tab (semantic search via Qdrant)
+    views.append(_build_search_view())
+
     # Add Settings tab as the rightmost view
     settings_view = _build_settings_view(hass, entry)
     views.append(settings_view)
@@ -137,6 +140,26 @@ def _build_dashboard(
     }
 
     return dashboard
+
+
+def _build_search_view() -> dict[str, Any]:
+    """Build the Search view — a full-screen iframe that loads the Qdrant search UI.
+
+    The UI is served by ArtSearchUIView at /api/frame_art_shuffler/search-ui.
+    Uses panel:true so the webpage card fills the entire viewport height.
+    """
+    return {
+        "title": "Search",
+        "path": "art-search",
+        "icon": "mdi:magnify",
+        "panel": True,
+        "cards": [
+            {
+                "type": "iframe",
+                "url": "/api/frame_art_shuffler/search-ui",
+            }
+        ],
+    }
 
 
 def _build_settings_view(hass: Any, entry: Any) -> dict[str, Any]:
@@ -403,6 +426,8 @@ def _get_tv_entities(
         "current_matte": f"{entry_id}_{tv_id}_current_matte",
         "current_filter": f"{entry_id}_{tv_id}_current_filter",
         "matte_filter": f"{entry_id}_{tv_id}_matte_filter",
+        "tv_actual_image": f"{entry_id}_{tv_id}_tv_actual_image",
+        "tv_actual_matte": f"{entry_id}_{tv_id}_tv_actual_matte",
         "tags_combined": f"{entry_id}_{tv_id}_tags_combined",
         "selected_tagset": f"{entry_id}_{tv_id}_selected_tagset",
         "override_tagset": f"{entry_id}_{tv_id}_override_tagset",
@@ -456,7 +481,8 @@ def _get_platform_for_key(key: str) -> str:
         "auto_bright_last", "auto_bright_next", "auto_bright_target",
         "auto_bright_sensor_lux", "auto_motion_last", "auto_motion_off_at",
         "recent_activity", "current_matte", "current_filter",
-        "matte_filter", "tags_combined", "selected_tagset", "override_tagset",
+        "matte_filter", "tv_actual_image", "tv_actual_matte",
+        "tags_combined", "selected_tagset", "override_tagset",
         "override_expiry", "matching_image_count",
     }
     numbers = {
@@ -510,16 +536,18 @@ def _build_power_controls_section(entities: dict[str, str]) -> dict[str, Any] | 
             "name": "Brightness Level",
         })
 
-    # Image metadata at bottom of this card
-    if "current_artwork" in entities:
+    # Image metadata — prefer actual TV state sensors over shuffler cache
+    current_image_entity = entities.get("tv_actual_image") or entities.get("current_artwork")
+    if current_image_entity:
         button_entities.append({
-            "entity": entities["current_artwork"],
+            "entity": current_image_entity,
             "name": "Current Image",
         })
 
-    if "matte_filter" in entities:
+    current_matte_entity = entities.get("tv_actual_matte") or entities.get("matte_filter")
+    if current_matte_entity:
         button_entities.append({
-            "entity": entities["matte_filter"],
+            "entity": current_matte_entity,
             "name": "Matte / Filter",
         })
 
@@ -563,26 +591,39 @@ def _build_artwork_section(entities: dict[str, str]) -> dict[str, Any] | None:
     - Markdown card with title "Artwork" and image
     - Entities card with shuffle button and details combined
     """
-    if "current_artwork" not in entities:
+    if "tv_actual_image" not in entities and "current_artwork" not in entities:
         return None
-    
-    artwork_entity = entities["current_artwork"]
-    screen_on_entity = entities.get("screen_on")
-    
-    cards = []
-    
-    # Build image template that includes screen off indicator and matte info
-    matte_entity = entities.get("current_matte")
-    if screen_on_entity:
-        image_template = f"""{{% if is_state('{screen_on_entity}', 'on') %}}
-![Current Art](/local/frame_art/library/{{{{ states('{artwork_entity}') }}}})
-{{% else %}}
-![Current Art](/local/frame_art/library/{{{{ states('{artwork_entity}') }}}})
 
-<center>***** Screen is off *****</center>
-{{% endif %}}"""
+    # Prefer actual TV state; fall back to shuffler cache for backward compat
+    artwork_entity = entities.get("tv_actual_image") or entities["current_artwork"]
+    matte_entity = entities.get("tv_actual_matte") or entities.get("current_matte")
+    screen_on_entity = entities.get("screen_on")
+
+    cards = []
+
+    # Build image template that includes screen off indicator and matte info.
+    # Guard against raw Samsung content IDs (e.g. "MY_F0051") that appear when
+    # the content_id_map hasn't been populated yet — they contain no "." so they
+    # can never be valid filenames.
+    img_expr = f"states('{artwork_entity}')"
+    img_block = (
+        f"{{% set _img = {img_expr} %}}\n"
+        f"{{% if '.' in _img %}}\n"
+        f"![Current Art](/local/frame_art/library/{{{{ _img }}}})\n"
+        f"{{% else %}}\n"
+        f"*(Syncing artwork…)*\n"
+        f"{{% endif %}}"
+    )
+    if screen_on_entity:
+        image_template = (
+            f"{{% if is_state('{screen_on_entity}', 'on') %}}\n"
+            + img_block
+            + f"\n{{% else %}}\n"
+            + img_block
+            + f"\n\n<center>***** Screen is off *****</center>\n{{% endif %}}"
+        )
     else:
-        image_template = f"![Current Art](/local/frame_art/library/{{{{ states('{artwork_entity}') }}}})"
+        image_template = img_block
 
     # Add matte info below the image, top left
     if matte_entity:
