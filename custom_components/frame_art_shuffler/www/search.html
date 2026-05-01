@@ -932,10 +932,13 @@
           btn.textContent = '✓ Sent';
           btn.classList.replace('sending', 'sent');
           showToast(`Displaying ${stemName(filename)}`, 'success');
-          // Loop: refresh the gallery around the image we just sent to the TV.
-          // Fires after the visual confirmation so the user sees the green tick
-          // before the page repaints.
-          setTimeout(() => runSimilar(filename), 600);
+          // If we're already in similar mode, close the loop: pick → send to
+          // TV → walk neighbors of the just-sent image. In plain search mode
+          // we leave the gallery static so the user keeps the result set
+          // they were working with.
+          if (similarTarget) {
+            setTimeout(() => runSimilar(filename), 600);
+          }
           setTimeout(() => {
             btn.textContent = 'Display';
             btn.classList.remove('sent');
