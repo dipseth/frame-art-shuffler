@@ -101,6 +101,77 @@
       cursor: not-allowed;
     }
 
+    /* ── Similar mode ────────────────────────────────────────── */
+    .similar-btn {
+      padding: 10px 14px;
+      background: transparent;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .similar-btn:hover { border-color: var(--accent); background: var(--accent-dim); }
+    .similar-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    #similar-banner {
+      display: none;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      background: var(--surface);
+      border: 1px solid var(--accent);
+      border-radius: 8px;
+      margin-bottom: 12px;
+      font-size: 12px;
+    }
+    #similar-banner.show { display: flex; }
+    #similar-banner img {
+      width: 28px;
+      height: 28px;
+      object-fit: cover;
+      border-radius: 4px;
+      flex-shrink: 0;
+    }
+    #similar-banner .label { color: var(--text-dim); font-weight: 600; }
+    #similar-banner .target-name {
+      color: var(--text);
+      max-width: 320px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    #similar-banner .clear-btn {
+      margin-left: auto;
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+      border-radius: 4px;
+      padding: 3px 10px;
+      font-size: 11px;
+      cursor: pointer;
+    }
+    #similar-banner .clear-btn:hover { color: var(--text); border-color: var(--text-dim); }
+
+    .similar-card-btn {
+      width: 32px;
+      padding: 6px 0;
+      background: var(--surface2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      font-size: 14px;
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    .similar-card-btn:hover {
+      border-color: var(--accent);
+      background: var(--accent-dim);
+    }
+
     /* ── Context strip ───────────────────────────────────────── */
     #context-strip {
       display: none;
@@ -386,9 +457,11 @@
       <option value="200">200 results</option>
     </select>
 
-    <button class="search-btn" id="search-btn" onclick="doSearch()">Search</button>
+    <button class="search-btn" id="similar-btn" onclick="runSimilarFromTv()" title="Find images similar to the one currently on the selected TV">Similar →</button>
+    <button class="similar-btn" id="search-btn" onclick="doSearch()">Search</button>
   </div>
 
+  <div id="similar-banner"></div>
   <div id="context-strip"></div>
 
   <div id="status"></div>
@@ -575,12 +648,19 @@
 
     // ── TV selector ──────────────────────────────────────────────
 
+    // Cached map of tv_id → { name, current_image, ... } from /search_config.
+    // Refreshed on page load and again when the user clicks "Similar →" so
+    // a freshly-displayed image is picked up without a full reload.
+    let tvData = {};
+
     async function loadTVs() {
       try {
         const r = await fetch(`${API}/search_config`);
         const data = await r.json();
+        tvData = {};
         const sel = document.getElementById('tv-selector');
         if (data.tvs && data.tvs.length > 0) {
+          data.tvs.forEach(tv => { tvData[tv.tv_id] = tv; });
           sel.innerHTML = data.tvs
             .map(tv => `<option value="${escHtml(tv.tv_id)}">${escHtml(tv.name)}</option>`)
             .join('');
@@ -591,6 +671,89 @@
         document.getElementById('tv-selector').innerHTML =
           '<option value="">Error loading TVs</option>';
       }
+    }
+
+    // ── Similar (Qdrant nearest-neighbor on a target filename) ───
+
+    let similarTarget = null;  // filename of the current "Similar to:" target
+
+    function renderSimilarBanner() {
+      const el = document.getElementById('similar-banner');
+      if (!similarTarget) {
+        el.classList.remove('show');
+        el.innerHTML = '';
+        return;
+      }
+      const src = `/local/frame_art/library/${encodeURIComponent(similarTarget)}`;
+      el.innerHTML = `
+        <img src="${escAttr(src)}" alt="">
+        <span class="label">Similar to:</span>
+        <span class="target-name">${escHtml(similarTarget)}</span>
+        <button type="button" class="clear-btn" data-action="clear-similar">Clear</button>`;
+      el.classList.add('show');
+    }
+
+    async function runSimilar(target) {
+      if (!target) return;
+      similarTarget = target;
+      renderSimilarBanner();
+      setStatus(`Finding similar to "${target}"…`);
+      document.getElementById('results').innerHTML = '';
+
+      const topK = parseInt(document.getElementById('count-selector').value || '16', 10);
+      try {
+        const url = `${API}/similar?target=${encodeURIComponent(target)}&top_k=${topK}`;
+        const r = await fetch(url);
+        const data = await r.json();
+        if (!r.ok || data.error) {
+          setStatus('Error: ' + (data.error || r.statusText), true);
+          return;
+        }
+        const results = data.results || [];
+        if (results.length === 0) {
+          setStatus(`No similar images for "${target}"`);
+          document.getElementById('results').innerHTML =
+            '<div class="placeholder">No neighbors found.</div>';
+          return;
+        }
+        setStatus(`${results.length} similar to "${target}"`);
+        document.getElementById('results').innerHTML = results.map(buildCard).join('');
+        fadeInImages();
+      } catch (e) {
+        setStatus('Similar failed: ' + e.message, true);
+      }
+    }
+
+    async function runSimilarFromTv() {
+      const tvId = document.getElementById('tv-selector').value;
+      if (!tvId) {
+        setStatus('Select a TV first', true);
+        return;
+      }
+      // Refresh tv data so the current_image reflects the latest displayed image
+      // even if the page has been open for a while.
+      try {
+        const r = await fetch(`${API}/search_config`);
+        const data = await r.json();
+        if (data.tvs) {
+          tvData = {};
+          data.tvs.forEach(tv => { tvData[tv.tv_id] = tv; });
+        }
+      } catch (_) { /* fall back to cached tvData */ }
+
+      const tv = tvData[tvId];
+      const target = tv && tv.current_image;
+      if (!target) {
+        setStatus(`No image currently known for ${tv?.name || tvId}`, true);
+        return;
+      }
+      runSimilar(target);
+    }
+
+    function clearSimilar() {
+      similarTarget = null;
+      renderSimilarBanner();
+      setStatus('');
     }
 
     // ── Search ───────────────────────────────────────────────────
@@ -721,6 +884,7 @@
             <div class="card-footer">
               <button class="${posCls}" data-vote="pos" data-filename="${escAttr(fn)}" title="More like this">👍</button>
               <button class="${negCls}" data-vote="neg" data-filename="${escAttr(fn)}" title="Less like this">👎</button>
+              <button class="similar-card-btn" data-similar="${escAttr(fn)}" title="Find images similar to this">🎯</button>
               <button class="display-btn" data-filename="${escAttr(fn)}">
                 Display
               </button>
@@ -854,6 +1018,14 @@
         if (fn) displayImage(dbtn, fn);
         return;
       }
+      // Similar (per-card 🎯) — chains "more like this" through Qdrant
+      const sbtn = e.target.closest('.similar-card-btn');
+      if (sbtn) {
+        e.stopPropagation();
+        const fn = sbtn.dataset.similar || '';
+        if (fn) runSimilar(fn);
+        return;
+      }
       // Vote buttons
       const vbtn = e.target.closest('.vote-btn');
       if (vbtn) {
@@ -861,6 +1033,11 @@
         if (vbtn.dataset.vote === 'pos') togglePositive(fn);
         else toggleNegative(fn);
       }
+    });
+
+    // Similar banner: clear button
+    document.getElementById('similar-banner').addEventListener('click', e => {
+      if (e.target.dataset.action === 'clear-similar') clearSimilar();
     });
 
     // Card image: click = positive, long-press / right-click = negative
@@ -894,7 +1071,13 @@
     });
 
     updateSearchButton();
-    loadTVs();
+    loadTVs().then(() => {
+      // Default action: show what's similar to the image currently on the TV
+      // so the dashboard isn't empty on open. Silent if no TV / no current image.
+      const tvId = document.getElementById('tv-selector').value;
+      const tv = tvData[tvId];
+      if (tv && tv.current_image) runSimilar(tv.current_image);
+    });
   </script>
 </body>
 </html>

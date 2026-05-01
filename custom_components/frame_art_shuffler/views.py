@@ -98,10 +98,16 @@ class ArtSearchConfigView(HomeAssistantView):
         tvs = []
         for tv_id, tv_config in tv_configs.items():
             entity_id = _tv_sensor_entity_id(self._hass, self._entry, tv_id)
+            current_image = None
+            if entity_id:
+                state = self._hass.states.get(entity_id)
+                if state and state.state not in (None, "", "unknown", "unavailable"):
+                    current_image = state.state
             tvs.append({
                 "tv_id": tv_id,
                 "name": tv_config.get("name", tv_id),
                 "entity_id": entity_id,
+                "current_image": current_image,
             })
 
         return web.json_response({"tvs": tvs})
@@ -167,6 +173,63 @@ class ArtDisplayView(HomeAssistantView):
             return web.json_response({"status": "ok", "filename": filename, "tv_id": tv_id})
         except Exception as err:  # noqa: BLE001
             _LOGGER.error("display_image call failed for %r on %r: %s", filename, tv_id, err)
+            return web.json_response({"error": str(err)}, status=500)
+
+
+class ArtSimilarView(HomeAssistantView):
+    """Find images similar to a given filename via Qdrant nearest-neighbor.
+
+    GET /api/frame_art_shuffler/similar?target=<filename>&top_k=<k>
+
+    Internally reuses store.discover() with empty context — Qdrant's
+    HNSW index returns the closest neighbors of the target point.
+    Excludes the target from the result list.
+    """
+
+    url = "/api/frame_art_shuffler/similar"
+    name = "api:frame_art_shuffler:similar"
+    requires_auth = False
+
+    def __init__(self, hass: Any, entry: Any) -> None:
+        self._hass = hass
+        self._entry = entry
+
+    async def get(self, request: Any) -> Any:
+        from aiohttp import web
+        from .const import DOMAIN
+
+        target = (request.query.get("target") or "").strip()
+        if not target:
+            return web.json_response(
+                {"error": "Missing query parameter 'target'"}, status=400
+            )
+
+        try:
+            top_k = max(1, min(int(request.query.get("top_k", "16")), 200))
+        except (ValueError, TypeError):
+            top_k = 16
+
+        data = self._hass.data.get(DOMAIN, {}).get(self._entry.entry_id, {})
+        store = data.get("qdrant_store")
+        if store is None:
+            return web.json_response({"error": "Qdrant not configured"}, status=503)
+
+        try:
+            # +1 because Qdrant returns the target itself at score 1.0; drop it.
+            raw = await self._hass.async_add_executor_job(
+                lambda: store.discover(
+                    target_filename=target,
+                    positives=[],
+                    negatives=[],
+                    top_k=top_k + 1,
+                )
+            )
+            results = [r for r in raw if r.get("filename") != target][:top_k]
+            return web.json_response({"target": target, "results": results})
+        except ValueError as err:
+            return web.json_response({"error": str(err)}, status=400)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.error("Similar failed for target=%r: %s", target, err)
             return web.json_response({"error": str(err)}, status=500)
 
 

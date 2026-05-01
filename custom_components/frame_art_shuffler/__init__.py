@@ -2491,11 +2491,13 @@ if _HA_AVAILABLE:
             ArtSearchConfigView,
             ArtSearchUIView,
             ArtSearchView,
+            ArtSimilarView,
         )
         hass.http.register_view(ArtSearchView(hass, entry))
         hass.http.register_view(ArtSearchConfigView(hass, entry))
         hass.http.register_view(ArtDisplayView(hass, entry))
         hass.http.register_view(ArtDiscoverView(hass, entry))
+        hass.http.register_view(ArtSimilarView(hass, entry))
         hass.http.register_view(ArtSearchUIView())
 
         # ------------------------------------------------------------------ #
