@@ -503,8 +503,16 @@
       return 'score-low';
     }
 
+    // Display name: strip extension, strip the manager-addon's 8-hex hash
+    // suffix (e.g. "-9b2c3ca2"), then turn dashes/underscores into spaces.
+    // Keeps the user-meaningful part of the filename and hides the technical
+    // hash that's always the same shape.
     function stemName(filename) {
-      return (filename || '').replace(/\.[^.]+$/, '').replace(/[-_]/g, ' ');
+      return (filename || '')
+        .replace(/\.[^.]+$/, '')
+        .replace(/-[0-9a-f]{8}$/i, '')
+        .replace(/[-_]/g, ' ')
+        .trim();
     }
 
     // ── Discovery context ────────────────────────────────────────
@@ -593,26 +601,26 @@
       } else if (context.positives.length) {
         const tfn = context.positives[0];
         targetChip = `
-          <span class="chip target">
+          <span class="chip target" title="${escAttr(tfn)}">
             <span class="chip-icon">🎯</span>
             ${chipImg(tfn)}
-            <span class="chip-text">${escHtml(tfn)}</span>
+            <span class="chip-text">${escHtml(stemName(tfn))}</span>
             <span class="chip-x" data-remove="pos" data-filename="${escAttr(tfn)}">×</span>
           </span>`;
         posOffset = 1;
       }
 
       const posChips = context.positives.slice(posOffset).map(fn => `
-        <span class="chip positive">
+        <span class="chip positive" title="${escAttr(fn)}">
           👍 ${chipImg(fn)}
-          <span class="chip-text">${escHtml(fn)}</span>
+          <span class="chip-text">${escHtml(stemName(fn))}</span>
           <span class="chip-x" data-remove="pos" data-filename="${escAttr(fn)}">×</span>
         </span>`).join('');
 
       const negChips = context.negatives.map(fn => `
-        <span class="chip negative">
+        <span class="chip negative" title="${escAttr(fn)}">
           👎 ${chipImg(fn)}
-          <span class="chip-text">${escHtml(fn)}</span>
+          <span class="chip-text">${escHtml(stemName(fn))}</span>
           <span class="chip-x" data-remove="neg" data-filename="${escAttr(fn)}">×</span>
         </span>`).join('');
 
@@ -688,7 +696,7 @@
       el.innerHTML = `
         <img src="${escAttr(src)}" alt="">
         <span class="label">Similar to:</span>
-        <span class="target-name">${escHtml(similarTarget)}</span>
+        <span class="target-name" title="${escAttr(similarTarget)}">${escHtml(stemName(similarTarget))}</span>
         <button type="button" class="clear-btn" data-action="clear-similar">Clear</button>`;
       el.classList.add('show');
     }
@@ -697,7 +705,7 @@
       if (!target) return;
       similarTarget = target;
       renderSimilarBanner();
-      setStatus(`Finding similar to "${target}"…`);
+      setStatus(`Finding similar to "${stemName(target)}"…`);
       document.getElementById('results').innerHTML = '';
 
       const topK = parseInt(document.getElementById('count-selector').value || '16', 10);
@@ -716,7 +724,7 @@
             '<div class="placeholder">No neighbors found.</div>';
           return;
         }
-        setStatus(`${results.length} similar to "${target}"`);
+        setStatus(`${results.length} similar to "${stemName(target)}"`);
         document.getElementById('results').innerHTML = results.map(buildCard).join('');
         fadeInImages();
       } catch (e) {
@@ -836,7 +844,7 @@
         const results = data.results || [];
         const targetDesc = q
           ? `target: "${q}"`
-          : `target: ${context.positives[0] || '?'}`;
+          : `target: ${stemName(context.positives[0] || '?')}`;
         const summary = `${targetDesc} • ${context.positives.length}👍 • ${context.negatives.length}👎`;
 
         if (results.length === 0) {
@@ -877,8 +885,8 @@
             <span class="score-badge ${scCls}">${pct}%</span>
           </div>
           <div class="card-body">
-            <div class="card-name">
-              <strong>${escHtml(stemName(fn))}</strong><br>${escHtml(fn)}
+            <div class="card-name" title="${escAttr(fn)}">
+              <strong>${escHtml(stemName(fn))}</strong>
             </div>
             ${tags ? `<div class="card-tags">${escHtml(tags)}${matte ? ' · ' + escHtml(matte) : ''}</div>` : ''}
             <div class="card-footer">
